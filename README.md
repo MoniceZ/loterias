@@ -26,14 +26,15 @@ Aplicação em Python com interface gráfica (PyQt6) para coleta automática de 
 
 ## Estrutura do Projeto
 
-| projeto_loteria/
-├── main.py # Entrada principal da aplicação
-├── ui.py # Interface gráfica
-├── coleta.py # Lógica de coleta dos concursos via Selenium
-├── predicao.py # Algoritmos de predição
-├── requirements.txt # Lista de dependências exatas
-└── loteria.ico # Ícone do programa (opcional)
-
+```text
+projeto_loteria/
+├── main.py             # Entrada principal da aplicação
+├── ui.py               # Interface gráfica
+├── coleta.py           # Lógica de coleta dos concursos via Selenium
+├── predicao.py         # Algoritmos de predição
+├── requirements.txt    # Lista de dependências exatas
+└── loteria.ico         # Ícone do programa (opcional)
+```
 
 ## Requisitos
 
