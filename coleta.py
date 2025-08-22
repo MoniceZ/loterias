@@ -131,3 +131,4 @@ class ColetorThread(QThread):
         finally:
             if driver is not None:
                 driver.quit()
+
