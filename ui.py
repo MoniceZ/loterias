@@ -1,37 +1,47 @@
+from __future__ import annotations
+
+from pathlib import Path
+
 import pandas as pd
-from PyQt6.QtWidgets import (
-    QWidget, QLabel, QComboBox, QLineEdit, QPushButton,
-    QVBoxLayout, QProgressBar, QTextEdit, QMessageBox
-)
-from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt
-from coleta import ColetorThread, gerar_url
-from predicao import gerar_palpite, carregar_dados
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QLabel,
+    QComboBox,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QProgressBar,
+    QTextEdit,
+    QMessageBox,
+    QWidget,
+)
+
+from coleta import ColetorThread
+from predicao import carregar_dados, gerar_palpite
 
 LOTERIAS = ["Mega Sena", "Lotofacil"]
 
+
 class App(QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Coletar Resultados de Loterias")
-        self.setFixedSize(500, 500)
+        self.setFixedSize(520, 520)
         self.setWindowIcon(QIcon("loteria.ico"))
-        self.setup_ui()
+        self._setup_ui()
 
-    def setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout()
 
-        self.label_loteria = QLabel("Loteria:")
-        layout.addWidget(self.label_loteria)
-
+        layout.addWidget(QLabel("Loteria:"))
         self.combo_loteria = QComboBox()
         self.combo_loteria.addItems(LOTERIAS)
         layout.addWidget(self.combo_loteria)
 
-        self.label_qtd = QLabel("Quantidade de concursos:")
-        layout.addWidget(self.label_qtd)
-
+        layout.addWidget(QLabel("Quantidade de concursos:"))
         self.input_qtd = QLineEdit("10")
+        self.input_qtd.setMaxLength(4)
         layout.addWidget(self.input_qtd)
 
         self.btn_coletar = QPushButton("Coletar Resultados")
@@ -52,94 +62,74 @@ class App(QWidget):
 
         self.setLayout(layout)
 
-    def iniciar_coleta(self):
+    # ---------- coleta ----------
+    def iniciar_coleta(self) -> None:
         loteria = self.combo_loteria.currentText()
-        qtd_text = self.input_qtd.text()
+        qtd_txt = self.input_qtd.text().strip()
 
-        if not qtd_text.isdigit():
+        if not qtd_txt.isdigit() or int(qtd_txt) <= 0:
             QMessageBox.critical(self, "Erro", "Quantidade inválida.")
             return
-
-        url = gerar_url(loteria)
-        qtd = int(qtd_text)
 
         self.log_area.clear()
         self.progress.setValue(0)
         self.log_area.append("🚀 Iniciando coleta...")
 
-        self.thread = ColetorThread(url, qtd)
+        self.thread = ColetorThread(loteria_nome=loteria, quantidade=int(qtd_txt))
         self.thread.progresso.connect(self.progress.setValue)
         self.thread.log.connect(self.log_area.append)
-        self.thread.finalizado.connect(self.finalizar)
+        self.thread.finalizado.connect(self._finalizar_coleta)
         self.thread.start()
 
-    def finalizar(self, df: pd.DataFrame):
+    def _finalizar_coleta(self, df: pd.DataFrame) -> None:
         if df.empty:
             self.log_area.append("⚠️ Nenhum resultado encontrado.")
             QMessageBox.warning(self, "Aviso", "Nenhum resultado foi coletado.")
-        else:
-            nome = self.combo_loteria.currentText().replace(" ", "_").replace("+", "mais")
-            df.to_csv(f"{nome}_resultados.csv", index=False, encoding="utf-8-sig")
-            self.log_area.append(f"💾 {len(df)} concursos salvos em {nome}_resultados.csv")
-            QMessageBox.information(self, "Sucesso", f"{len(df)} concursos salvos com sucesso.")
+            return
 
-    def predizer_jogo(self):
+        nome_base = self.combo_loteria.currentText().replace(" ", "_").replace("+", "mais")
+        saida = Path(f"{nome_base}_resultados.csv")
+        df.to_csv(saida, index=False, encoding="utf-8-sig")
+        self.log_area.append(f"💾 {len(df)} concursos salvos em {saida.name}")
+        QMessageBox.information(self, "Sucesso", f"{len(df)} concursos salvos com sucesso.")
+
+    # ---------- predição ----------
+    def predizer_jogo(self) -> None:
         loteria = self.combo_loteria.currentText()
-        nome = loteria.replace(" ", "_").replace("+", "mais")
-        arquivo_csv = f"{nome}_resultados.csv"
+        nome_base = loteria.replace(" ", "_").replace("+", "mais")
+        arquivo_csv = Path(f"{nome_base}_resultados.csv")
+
+        if not arquivo_csv.exists():
+            QMessageBox.critical(self, "Erro", "Você precisa coletar os dados primeiro.")
+            return
 
         try:
-            df = carregar_dados(arquivo_csv)
             self.log_area.append("🔍 Iniciando predição...")
             self.progress.setValue(0)
 
-            total_passos = 7
-            passo = 0
-            palpites = {}
+            df = carregar_dados(arquivo_csv)
+            # calcula tudo de uma vez
+            palpites = gerar_palpite(df, loteria)
 
-            self.log_area.append("📊 Frequência simples...")
-            palpites["frequencia_simples"] = gerar_palpite(df, loteria)["frequencia_simples"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
+            etapas = [
+                "frequencia_simples",
+                "recencia_ponderada",
+                "random_forest",
+                "logistic_regression",
+                "k_nearest_neighbors",
+                "gradient_boosting",
+                "melhor_combinacao",
+            ]
 
-            self.log_area.append("📈 Recência ponderada...")
-            palpites["recencia_ponderada"] = gerar_palpite(df, loteria)["recencia_ponderada"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
+            for i, chave in enumerate(etapas, start=1):
+                nums = palpites.get(chave, [])
+                self.log_area.append(f"{'🧠 Voto final' if chave=='melhor_combinacao' else '•'} {chave}: {', '.join(map(str, nums))}")
+                self.progress.setValue(int(i / len(etapas) * 100))
 
-            self.log_area.append("🌲 Random Forest...")
-            palpites["random_forest"] = gerar_palpite(df, loteria)["random_forest"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
-
-            self.log_area.append("📦 Regressão Logística...")
-            palpites["logistic_regression"] = gerar_palpite(df, loteria)["logistic_regression"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
-
-            self.log_area.append("📡 KNN...")
-            palpites["k_nearest_neighbors"] = gerar_palpite(df, loteria)["k_nearest_neighbors"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
-
-            self.log_area.append("🚀 Gradient Boosting...")
-            palpites["gradient_boosting"] = gerar_palpite(df, loteria)["gradient_boosting"]
-            passo += 1
-            self.progress.setValue(int((passo / total_passos) * 100))
-
-            self.log_area.append("🧠 Votação final...")
-            palpites["melhor_combinacao"] = gerar_palpite(df, loteria)["melhor_combinacao"]
-            passo += 1
-            self.progress.setValue(100)
-
-            self.log_area.append("\n🔮 Resultado final:")
-            for metodo, nums in palpites.items():
-                nums_str = ', '.join(str(n) for n in nums)
-                self.log_area.append(f"{metodo}: {nums_str}")
-
-            QMessageBox.information(self, "Previsão Concluída", f"Melhor jogo previsto: {', '.join(map(str, palpites['melhor_combinacao']))}")
-
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Erro", "Você precisa coletar os dados primeiro.")
+            QMessageBox.information(
+                self,
+                "Previsão Concluída",
+                f"Melhor jogo previsto: {', '.join(map(str, palpites['melhor_combinacao']))}",
+            )
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Ocorreu um erro na predição: {e}")
