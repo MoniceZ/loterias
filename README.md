@@ -1,6 +1,6 @@
 # Coletor e Preditor de Resultados de Loterias
 
-Aplicação em Python com interface gráfica (PyQt6) para coleta automática de resultados de loterias (Mega Sena e Lotofácil) e geração de previsões baseadas em modelos estatísticos e de aprendizado de máquina.
+Aplicação em Python com interface gráfica (PyQt6) para coleta automática de resultados de loterias (Mega Sena, Lotofácil, Quina e Lotomania) e geração de previsões baseadas em modelos estatísticos e de aprendizado de máquina.
 
 ## Funcionalidades
 
