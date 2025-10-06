@@ -23,6 +23,8 @@ def _top_n_por_tipo(tipo_loteria: str) -> int:
         return 6
     if "quina" in t:
         return 5
+    if "lotomania" in t:
+        return 50  # 50 dezenas escolhidas no jogo
     return 20
 
 

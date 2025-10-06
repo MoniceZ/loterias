@@ -35,6 +35,8 @@ def obter_max_dezenas(loteria_nome: str) -> int:
         return 6
     if "quina" in loteria:
         return 5
+    if "lotomania" in loteria:
+        return 20
     return 20
 
 

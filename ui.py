@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 from coleta import ColetorThread
 from predicao import carregar_dados, gerar_palpite
 
-LOTERIAS = ["Mega Sena", "Lotofacil", "Quina"]
+LOTERIAS = ["Mega Sena", "Lotofacil", "Quina", "Lotomania"]
 
 
 class App(QWidget):
