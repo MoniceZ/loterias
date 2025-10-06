@@ -33,6 +33,8 @@ def obter_max_dezenas(loteria_nome: str) -> int:
         return 15
     if "mega" in loteria:
         return 6
+    if "quina" in loteria:
+        return 5
     return 20
 
 
@@ -84,7 +86,6 @@ class ColetorThread(QThread):
 
             total_alvo = max(self.quantidade, 1)
             for idx, strong in enumerate(elementos, start=1):
-                # Título geralmente é o número do concurso no <strong>
                 concurso = strong.text.strip()
                 if not concurso.isdigit():
                     continue
@@ -131,4 +132,3 @@ class ColetorThread(QThread):
         finally:
             if driver is not None:
                 driver.quit()
-

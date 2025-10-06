@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 from coleta import ColetorThread
 from predicao import carregar_dados, gerar_palpite
 
-LOTERIAS = ["Mega Sena", "Lotofacil"]
+LOTERIAS = ["Mega Sena", "Lotofacil", "Quina"]
 
 
 class App(QWidget):
@@ -108,7 +108,6 @@ class App(QWidget):
             self.progress.setValue(0)
 
             df = carregar_dados(arquivo_csv)
-            # calcula tudo de uma vez
             palpites = gerar_palpite(df, loteria)
 
             etapas = [

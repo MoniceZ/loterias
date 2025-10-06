@@ -21,6 +21,8 @@ def _top_n_por_tipo(tipo_loteria: str) -> int:
         return 15
     if "mega" in t:
         return 6
+    if "quina" in t:
+        return 5
     return 20
 
 
@@ -41,7 +43,6 @@ def predizer_por_frequencia(df: pd.DataFrame, top_n: int) -> List[int]:
 
 def predizer_por_recencia(df: pd.DataFrame, top_n: int) -> List[int]:
     cols = [c for c in df.columns if c.startswith("num_")]
-    # pesos decrescentes do mais recente para o mais antigo
     pesos = np.linspace(1.0, 0.1, num=len(df))
     cont: Counter[int] = Counter()
     for w, row in zip(pesos, df[cols].to_numpy()):
@@ -58,7 +59,6 @@ def _preparar_ml(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, int]:
     X: List[List[int]] = []
     Y: List[List[int]] = []
 
-    # cada linha prevê a próxima
     for i in range(len(arr) - 1):
         atual = arr.iloc[i].tolist()
         prox = arr.iloc[i + 1].tolist()
@@ -76,14 +76,13 @@ def _preparar_ml(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, int]:
 
 def _rank_por_modelo(df: pd.DataFrame, top_n: int, base_estimator) -> List[int]:
     X, Y, max_d = _preparar_ml(df)
-    if len(X) < 5:  # dados insuficientes
+    if len(X) < 5:
         return list(range(1, min(top_n, max_d) + 1))
 
     X_train, X_test, y_train, _y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
     clf = OneVsRestClassifier(base_estimator)
     clf.fit(X_train, y_train)
 
-    # score da última linha conhecida
     scores = None
     if hasattr(clf, "predict_proba"):
         scores = clf.predict_proba([X[-1]])[0]
