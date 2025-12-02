@@ -41,6 +41,8 @@ class PreditorThread(QThread):
             self.log.emit("🔍 Iniciando predição...")
             self.progresso.emit(0)
             df = carregar_dados(self.arquivo_csv)
+            # aqui é uma “caixa preta”: o progresso interno é do modelo,
+            # então marcamos início (0%) e fim (100%)
             palpites = gerar_palpite(df, self.loteria)
             self.progresso.emit(100)
             self.resultado.emit(palpites)
@@ -53,7 +55,7 @@ class App(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Previsor de Loterias Inteligente")
-        self.setFixedSize(680, 620)
+        self.setFixedSize(700, 640)
         self.setWindowIcon(QIcon("loteria.ico"))
         self._setup_ui()
 
@@ -63,7 +65,7 @@ class App(QWidget):
 
         lbl_title = QLabel("🎯 Previsor de Loterias Inteligente")
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #Ffffff;")
+        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #FFFFFF;")
         layout.addWidget(lbl_title)
 
         layout.addWidget(QLabel("Loteria:"))
@@ -86,6 +88,7 @@ class App(QWidget):
 
         self.progress = QProgressBar()
         self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress.setFormat("%p%")  # mostra o valor em %
         layout.addWidget(self.progress)
 
         lbl_log = QLabel("📄 Log de Execução:")
@@ -95,11 +98,17 @@ class App(QWidget):
         self.log_area.setReadOnly(True)
         layout.addWidget(self.log_area)
 
-        lbl_perf = QLabel("📊 Desempenho dos Modelos:")
+        lbl_perf = QLabel("📊 Desempenho dos Modelos (F1/Acc médios):")
         layout.addWidget(lbl_perf)
 
-        self.table_perf = QTableWidget(0, 3)
-        self.table_perf.setHorizontalHeaderLabels(["Modelo", "Desempenho Atual", "Variação"])
+        # agora com 4 colunas
+        self.table_perf = QTableWidget(0, 4)
+        self.table_perf.setHorizontalHeaderLabels([
+            "Modelo",
+            "Histórico (%)",
+            "Atual (%)",
+            "Evolução (p.p. / %)"
+        ])
         self.table_perf.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_perf.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_perf)
@@ -107,9 +116,11 @@ class App(QWidget):
         self.setLayout(layout)
         self.setStyleSheet("""
             QPushButton { padding: 6px; font-weight: bold; }
-            QTextEdit { background: #000000; font-family: Consolas; font-size: 13px; }
+            QTextEdit { background: #000000; color: #FFFFFF; font-family: Consolas; font-size: 13px; }
             QProgressBar { height: 35px; }
             QComboBox, QLineEdit { height: 26px; }
+            QTableWidget { background: #1e1e1e; color: #ffffff; gridline-color: #444444; }
+            QHeaderView::section { background-color: #333333; color: #ffffff; font-weight: bold; }
         """)
 
     # ---------- coleta ----------
@@ -178,35 +189,106 @@ class App(QWidget):
 
         for chave in etapas:
             nums = palpites.get(chave, [])
+            if not nums:
+                continue
+
             if chave == "melhor_combinacao":
                 self._append_log(f"🎯 Melhor combinação: {', '.join(map(str, nums))}\n")
             else:
                 self._append_log(f"• {chave}: {', '.join(map(str, nums))}")
 
-        # desempenho e variação histórica
+        # desempenho e variação histórica em %
         self._atualizar_tabela_desempenho(palpites)
 
-        QMessageBox.information(
-            self,
-            "Previsão Concluída",
-            f"Melhor jogo previsto:\n{', '.join(map(str, palpites['melhor_combinacao']))}",
-        )
+        melhor = palpites.get("melhor_combinacao", [])
+        if melhor:
+            QMessageBox.information(
+                self,
+                "Previsão Concluída",
+                f"Melhor jogo previsto:\n{', '.join(map(str, melhor))}",
+            )
 
     def _atualizar_tabela_desempenho(self, palpites: dict) -> None:
-        historico = _carregar_historico()
-        atual = palpites.get("avaliacao_modelos", {})
+        historico = _carregar_historico()        # médias históricas (0–1)
+        atual = palpites.get("avaliacao_modelos", {})  # scores atuais (0–1)
 
         self.table_perf.setRowCount(0)
-        for modelo, score_atual in atual.items():
-            score_hist = historico.get(modelo, 0)
-            variacao = round(score_atual - score_hist, 4)
-            emoji = "🔼" if variacao > 0 else "🔽" if variacao < 0 else "⏺️"
+
+        if not atual:
+            self._append_log("ℹ️ Nenhuma métrica de desempenho retornada pelos modelos.")
+            return
+
+        melhor_modelo = None
+        melhor_score_atual = -1.0
+        melhor_hist = 0.0
+        melhor_delta_pct_rel = 0.0
+
+        # garantir ordem estável
+        for modelo in sorted(atual.keys()):
+            score_atual = float(atual.get(modelo, 0.0))
+            score_hist = float(historico.get(modelo, 0.0))
+
+            # conversão para %
+            hist_pct = score_hist * 100.0
+            atual_pct = score_atual * 100.0
+            delta_pp = atual_pct - hist_pct  # pontos percentuais
+
+            if hist_pct > 0:
+                delta_pct_rel = (delta_pp / hist_pct) * 100.0
+            else:
+                delta_pct_rel = 0.0
+
+            # ícone
+            if score_hist == 0 and score_atual > 0:
+                emoji = "🆕"
+            elif delta_pp > 0:
+                emoji = "🔼"
+            elif delta_pp < 0:
+                emoji = "🔽"
+            else:
+                emoji = "⏺️"
 
             linha = self.table_perf.rowCount()
             self.table_perf.insertRow(linha)
-            self.table_perf.setItem(linha, 0, QTableWidgetItem(modelo))
-            self.table_perf.setItem(linha, 1, QTableWidgetItem(f"{score_atual:.4f}"))
-            self.table_perf.setItem(linha, 2, QTableWidgetItem(f"{emoji} {variacao:+.4f}"))
+
+            item_modelo = QTableWidgetItem(modelo)
+            item_hist = QTableWidgetItem(f"{hist_pct:.2f}%")
+            item_atual = QTableWidgetItem(f"{atual_pct:.2f}%")
+            item_evol = QTableWidgetItem(
+                f"{emoji} {delta_pp:+.2f} p.p. / {delta_pct_rel:+.2f}%"
+            )
+
+            for item in (item_modelo, item_hist, item_atual, item_evol):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # tooltip explicando
+            item_evol.setToolTip(
+                f"Histórico: {hist_pct:.2f}%\n"
+                f"Atual: {atual_pct:.2f}%\n"
+                f"Variação: {delta_pp:+.2f} p.p. ({delta_pct_rel:+.2f}%)"
+            )
+
+            self.table_perf.setItem(linha, 0, item_modelo)
+            self.table_perf.setItem(linha, 1, item_hist)
+            self.table_perf.setItem(linha, 2, item_atual)
+            self.table_perf.setItem(linha, 3, item_evol)
+
+            # tracking do melhor modelo atual
+            if score_atual > melhor_score_atual:
+                melhor_score_atual = score_atual
+                melhor_modelo = modelo
+                melhor_hist = score_hist
+                melhor_delta_pct_rel = delta_pct_rel
+
+        # resumo no log com progresso em %
+        if melhor_modelo is not None:
+            hist_pct = melhor_hist * 100.0
+            atual_pct = melhor_score_atual * 100.0
+            self._append_log(
+                f"🏅 Melhor modelo no momento: {melhor_modelo} "
+                f"→ Atual: {atual_pct:.2f}% | Histórico: {hist_pct:.2f}% "
+                f"| Evolução relativa: {melhor_delta_pct_rel:+.2f}%"
+            )
 
     # ---------- log helper ----------
     def _append_log(self, msg: str) -> None:
