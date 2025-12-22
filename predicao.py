@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -19,34 +18,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
 
-# opcional (melhor para sparse)
-try:
-    from scipy import sparse
-    _HAS_SCIPY = True
-except Exception:
-    sparse = None
-    _HAS_SCIPY = False
 
-
-# =========================
-# CONFIG “PESADEIRO” (CPU/GPU)
-# =========================
-@dataclass(frozen=True)
-class TrainConfig:
-    lags: int = 8                 # mais lags => mais features => mais CPU
-    ewm_alpha: float = 0.08       # recência exponencial (0..1) menor => mais “memória”
-    cv_splits: int = 6            # backtesting pesado
-    randomized_search_iter: int = 35  # tuning pesado (usa todos cores)
-    use_random_search_min_samples: int = 180  # só faz tuning se tiver histórico suficiente
-    random_state: int = 42
-
-
-CFG = TrainConfig()
-
-
-# =========================
-# util
-# =========================
+# ---------- util ----------
 def _top_n_por_tipo(tipo_loteria: str) -> int:
     t = tipo_loteria.lower()
     if "facil" in t:
@@ -136,6 +109,7 @@ def _salvar_historico(
     desempenho: Dict[str, float],
     caminho: str = "historico_modelos.csv",
 ) -> None:
+    """Salva ou atualiza o histórico de desempenho em CSV."""
     data = {
         "data_execucao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "tipo_loteria": tipo_loteria,
@@ -160,18 +134,13 @@ def _carregar_historico(caminho: str = "historico_modelos.csv") -> Dict[str, flo
     se não existir histórico).
     """
     p = Path(caminho)
-    # pesos base caso não haja histórico
-    base = {
-        "random_forest": 1.0,
-        "extra_trees": 1.0,
-        "logistic_regression": 1.0,
-        "k_nearest_neighbors": 1.0,
-        "hist_gradient_boosting": 1.0,
-        "xgboost": 1.0,
-    }
-
     if not p.exists():
-        return base
+        return {
+            "random_forest": 1.0,
+            "logistic_regression": 1.0,
+            "k_nearest_neighbors": 1.0,
+            "gradient_boosting": 1.0,
+        }
 
     df = pd.read_csv(p)
     medias: Dict[str, float] = {}
@@ -195,9 +164,7 @@ def _carregar_historico(caminho: str = "historico_modelos.csv") -> Dict[str, flo
     return medias
 
 
-# =========================
-# persistência de modelos
-# =========================
+# ---------- persistência de modelos ----------
 def _slug_tipo(tipo_loteria: str) -> str:
     return tipo_loteria.lower().replace(" ", "_").replace("+", "mais")
 
@@ -239,9 +206,7 @@ def _max_num_por_tipo(tipo_loteria: str, df: pd.DataFrame) -> int:
     return int(arr.max())
 
 
-# =========================
-# heurísticas
-# =========================
+# ---------- heurísticas ----------
 def predizer_por_frequencia(df: pd.DataFrame, top_n: int) -> List[int]:
     dezenas = df[[c for c in df.columns if c.startswith("num_")]].to_numpy().ravel()
     cont = Counter(map(int, dezenas))
@@ -258,88 +223,33 @@ def predizer_por_recencia(df: pd.DataFrame, top_n: int) -> List[int]:
     return sorted([d for d, _ in cont.most_common(top_n)])
 
 
-# =========================
-# FEATURES “PESADAS”
-# =========================
-def _onehot_row(nums: List[int], max_d: int) -> np.ndarray:
-    v = np.zeros(max_d + 1, dtype=np.float32)
-    for d in nums:
-        if 0 <= int(d) <= max_d:
-            v[int(d)] = 1.0
-    return v
-
-
-def _preparar_ml_pesado(
-    df: pd.DataFrame,
-    tipo_loteria: str,
-    lags: int = CFG.lags,
-    ewm_alpha: float = CFG.ewm_alpha,
-) -> Tuple[Any, np.ndarray, int]:
-    """
-    X “bem maior”:
-      - one-hot do concurso atual e de (lags-1) anteriores (concatenado)
-      - frequência acumulada (rolling cumulativo) por dezena
-      - recência exponencial (EWM) por dezena
-    Y: dezenas do próximo concurso (multi-label binário)
-    """
+# ---------- ML base ----------
+def _preparar_ml(df: pd.DataFrame, tipo_loteria: str) -> Tuple[np.ndarray, np.ndarray, int]:
     cols = [c for c in df.columns if c.startswith("num_")]
     arr = df[cols].astype(int)
     max_d = _max_num_por_tipo(tipo_loteria, df)
 
+    X: List[List[int]] = []
+    Y: List[List[int]] = []
+
     if len(arr) < 2:
-        if _HAS_SCIPY:
-            return sparse.csr_matrix((0, (max_d + 1) * lags + 2 * (max_d + 1))), np.zeros((0, max_d + 1), dtype=np.int8), max_d
-        return np.zeros((0, (max_d + 1) * lags + 2 * (max_d + 1)), dtype=np.float32), np.zeros((0, max_d + 1), dtype=np.int8), max_d
+        return np.asarray(X), np.asarray(Y), max_d
 
-    # transforma concursos em matriz one-hot (N x (max_d+1))
-    oh = np.zeros((len(arr), max_d + 1), dtype=np.float32)
-    for i in range(len(arr)):
-        oh[i] = _onehot_row(arr.iloc[i].tolist(), max_d)
-
-    # rolling cumulativo de frequência (normalizado)
-    cumsum = np.cumsum(oh, axis=0)
-    denom = np.arange(1, len(arr) + 1, dtype=np.float32).reshape(-1, 1)
-    freq_cum = cumsum / denom
-
-    # recência exponencial (EWM) aproximada via filtro recursivo
-    ewm = np.zeros_like(oh, dtype=np.float32)
-    prev = np.zeros((max_d + 1,), dtype=np.float32)
-    a = float(ewm_alpha)
-    for i in range(len(arr)):
-        prev = a * oh[i] + (1.0 - a) * prev
-        ewm[i] = prev
-
-    # constrói X com lags
-    X_blocks = []
-    for k in range(lags):
-        # shift para trás: X usa info até o concurso i, prediz i+1
-        start = k
-        end = len(arr) - 1  # último não tem próximo
-        X_blocks.append(oh[start:end])
-
-    # alinha blocos por tamanho mínimo (len(arr)-1-lags+1)
-    min_len = len(arr) - 1 - (lags - 1)
-    if min_len <= 0:
-        # pouco histórico: volta para heurística depois
-        if _HAS_SCIPY:
-            return sparse.csr_matrix((0, 1)), np.zeros((0, 1), dtype=np.int8), max_d
-        return np.zeros((0, 1), dtype=np.float32), np.zeros((0, 1), dtype=np.int8), max_d
-
-    X_lags = [b[:min_len] for b in X_blocks]  # cada um (min_len x (max_d+1))
-    X_main = np.concatenate(X_lags, axis=1)   # (min_len x ((max_d+1)*lags))
-
-    # adiciona features globais alinhadas ao “t” do último lag (i = (lags-1) ..)
-    idx0 = lags - 1
-    freq_part = freq_cum[idx0: idx0 + min_len]
-    ewm_part = ewm[idx0: idx0 + min_len]
-    X_dense = np.concatenate([X_main, freq_part, ewm_part], axis=1).astype(np.float32)
-
-    # labels Y: próximo concurso do “t” atual
-    Y_list: List[List[int]] = []
-    for i in range(idx0, idx0 + min_len):
+    for i in range(len(arr) - 1):
+        atual = arr.iloc[i].tolist()
         prox = arr.iloc[i + 1].tolist()
+
+        linha = [0] * (max_d + 1)
+        for d in atual:
+            if 0 <= d <= max_d:
+                linha[int(d)] = 1
+
         prox_limpo = [int(x) for x in prox if 0 <= int(x) <= max_d]
-        Y_list.append(sorted(set(prox_limpo)))
+        Y.append(sorted(set(prox_limpo)))
+        X.append(linha)
+
+    if not X or not Y:
+        return np.asarray(X), np.asarray(Y), max_d
 
     mlb = MultiLabelBinarizer(classes=list(range(max_d + 1)))
     y_bin = mlb.fit_transform(Y)
@@ -356,16 +266,12 @@ def _avaliar_modelo(clf, X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
     f1s: List[float] = []
     accs: List[float] = []
 
-    for train_idx, test_idx in tscv.split(np.arange(n)):
-        X_train = X[train_idx]
-        X_test = X[test_idx]
-        y_train = Y[train_idx]
-        y_test = Y[test_idx]
-
+    for train_idx, test_idx in kf.split(X, y_estrato):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = Y[train_idx], Y[test_idx]
         clf.fit(X_train, y_train)
         pred = clf.predict(X_test)
-
-        f1s.append(f1_score(y_test, pred, average="micro", zero_division=0))
+        f1s.append(f1_score(y_test, pred, average="micro"))
         accs.append(accuracy_score(y_test, pred))
 
     return float(np.mean(f1s)), float(np.mean(accs))
@@ -405,11 +311,11 @@ def _selecionar_top_dezenas_por_scores(
 def _rank_por_modelo(
     df: pd.DataFrame,
     top_n: int,
-    base_estimator: BaseEstimator,
+    base_estimator,
     tipo_loteria: str,
     nome_modelo: str,
 ) -> Tuple[List[int], float]:
-    X, Y, max_d = _preparar_ml_pesado(df, tipo_loteria)
+    X, Y, max_d = _preparar_ml(df, tipo_loteria)
 
     if len(X) < 10 or Y.size == 0:
         return predizer_por_frequencia(df, top_n), 0.0
@@ -417,14 +323,13 @@ def _rank_por_modelo(
     salvo = _tentar_carregar_modelo(tipo_loteria, nome_modelo)
     pipeline_antigo = salvo.get("pipeline") if isinstance(salvo, dict) else None
     n_features_salvo = salvo.get("n_features") if isinstance(salvo, dict) else None
-    lags_salvo = salvo.get("lags") if isinstance(salvo, dict) else None
 
-    melhor_pipeline: Optional[BaseEstimator] = None
+    melhor_pipeline = None
     melhor_score = 0.0
 
     if pipeline_antigo is not None and n_features_salvo == X.shape[1]:
         try:
-            f1_old, acc_old = _avaliar_modelo_timeseries(pipeline_antigo, X, Y, CFG.cv_splits)
+            f1_old, acc_old = _avaliar_modelo(pipeline_antigo, X, Y)
             melhor_score = (f1_old + acc_old) / 2.0
             melhor_pipeline = pipeline_antigo
         except Exception:
@@ -444,7 +349,7 @@ def _rank_por_modelo(
 
     if score_novo >= melhor_score:
         melhor_score = score_novo
-        melhor_pipeline = pipeline_candidato
+        melhor_pipeline = pipeline_novo
 
     melhor_pipeline.fit(X, Y)
 
@@ -476,37 +381,21 @@ def predizer_random_forest(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
     clf = RandomForestClassifier(
-        n_estimators=1400,
+        n_estimators=400,
         max_depth=None,
-        max_features="sqrt",
-        min_samples_leaf=1,
         n_jobs=-1,
-        random_state=CFG.random_state,
+        random_state=42,
     )
     return _rank_por_modelo(df, top_n, clf, tipo_loteria, "random_forest")
-
-
-def predizer_extra_trees(df: pd.DataFrame, top_n: int, tipo_loteria: str) -> Tuple[List[int], float]:
-    clf = ExtraTreesClassifier(
-        n_estimators=2200,
-        max_depth=None,
-        max_features="sqrt",
-        min_samples_leaf=1,
-        n_jobs=-1,
-        random_state=CFG.random_state,
-    )
-    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "extra_trees")
 
 
 def predizer_logistic(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
     clf = LogisticRegression(
-        max_iter=6000,
-        solver="saga",
-        penalty="l2",
-        n_jobs=-1,
-        random_state=CFG.random_state,
+        max_iter=3000,
+        solver="lbfgs",
+        random_state=42,
     )
     return _rank_por_modelo(df, top_n, clf, tipo_loteria, "logistic_regression")
 
@@ -515,22 +404,18 @@ def predizer_knn(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
     clf = KNeighborsClassifier(
-        n_neighbors=11,
+        n_neighbors=5,
         weights="distance",
-        metric="minkowski",
-        p=2,
     )
     return _rank_por_modelo(df, top_n, clf, tipo_loteria, "k_nearest_neighbors")
 
 
-def predizer_hgb(df: pd.DataFrame, top_n: int, tipo_loteria: str) -> Tuple[List[int], float]:
-    # substitui o GradientBoosting (single-core) por HistGradientBoosting (bem mais forte)
-    clf = HistGradientBoostingClassifier(
-        max_iter=900,
+def predizer_gb(df: pd.DataFrame, top_n: int, tipo_loteria: str) -> Tuple[List[int], float]:
+    clf = GradientBoostingClassifier(
+        n_estimators=300,
         learning_rate=0.05,
-        max_depth=9,
-        l2_regularization=0.1,
-        random_state=CFG.random_state,
+        max_depth=5,
+        random_state=42,
     )
     return _rank_por_modelo(df, top_n, clf, tipo_loteria, "gradient_boosting")
 
@@ -663,20 +548,16 @@ def gerar_palpite(
         "frequencia_simples": freq,
         "recencia_ponderada": rec,
         "random_forest": rf,
-        "extra_trees": et,
         "logistic_regression": lg,
         "k_nearest_neighbors": kn,
-        "hist_gradient_boosting": hgb,
-        "xgboost": xgb,
+        "gradient_boosting": gb,
     }
 
     desempenho = {
-        "random_forest": rf_sc,
-        "extra_trees": et_sc,
-        "logistic_regression": lg_sc,
-        "k_nearest_neighbors": kn_sc,
-        "hist_gradient_boosting": hgb_sc,
-        "xgboost": xgb_sc,
+        "random_forest": rf_acc,
+        "logistic_regression": lg_acc,
+        "k_nearest_neighbors": kn_acc,
+        "gradient_boosting": gb_acc,
     }
 
     pesos_modelos: Dict[str, float] = {
@@ -696,7 +577,6 @@ def gerar_palpite(
 
     votos: Counter[int] = Counter()
     for nome, lista in resultados.items():
-        peso = float(pesos_modelos.get(nome, 1.0))
         peso = float(pesos_modelos.get(nome, 1.0))
         for d in lista:
             votos[int(d)] += peso
