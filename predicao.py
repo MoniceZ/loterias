@@ -16,7 +16,20 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
+from sklearn.preprocessing import StandardScaler
+
+# =========================
+# Tuning (sem mudar API)
+# =========================
+_RANDOM_STATE = 42
+
+# Você pode “pesar a mão” sem editar o arquivo:
+#   Windows (PowerShell):  $env:LOTO_RF_N_ESTIMATORS="2000"
+#   Linux/macOS:          export LOTO_RF_N_ESTIMATORS=2000
+_LOTO_LOOKBACK = int(np.clip(int(__import__("os").environ.get("LOTO_LOOKBACK", "3")), 1, 20))
+_LOTO_CV_SPLITS = int(np.clip(int(__import__("os").environ.get("LOTO_CV_SPLITS", "5")), 3, 10))
+_LOTO_RF_N_ESTIMATORS = int(np.clip(int(__import__("os").environ.get("LOTO_RF_N_ESTIMATORS", "1200")), 200, 5000))
+_LOTO_GB_N_ESTIMATORS = int(np.clip(int(__import__("os").environ.get("LOTO_GB_N_ESTIMATORS", "800")), 100, 5000))
 
 
 # ---------- util ----------
@@ -206,62 +219,123 @@ def _max_num_por_tipo(tipo_loteria: str, df: pd.DataFrame) -> int:
     return int(arr.max())
 
 
-# ---------- heurísticas ----------
+# ---------- heurísticas (vetorizadas e com recência correta) ----------
 def predizer_por_frequencia(df: pd.DataFrame, top_n: int) -> List[int]:
-    dezenas = df[[c for c in df.columns if c.startswith("num_")]].to_numpy().ravel()
-    cont = Counter(map(int, dezenas))
-    return sorted([d for d, _ in cont.most_common(top_n)])
+    cols = [c for c in df.columns if c.startswith("num_")]
+    dezenas = df[cols].to_numpy(dtype=np.int64).ravel()
+    dezenas = dezenas[dezenas >= 0]
+    if dezenas.size == 0:
+        return []
+    cont = np.bincount(dezenas, minlength=int(dezenas.max()) + 1).astype(np.float64)
+    nums = np.arange(cont.size, dtype=np.int64)
+    order = np.lexsort((nums, -cont))  # (cont desc, num asc)
+    escolhidos = nums[order][: int(top_n)]
+    return sorted(int(x) for x in escolhidos.tolist())
 
 
 def predizer_por_recencia(df: pd.DataFrame, top_n: int) -> List[int]:
     cols = [c for c in df.columns if c.startswith("num_")]
-    pesos = np.geomspace(1.0, 0.01, num=len(df))
-    cont: Counter[int] = Counter()
-    for w, row in zip(pesos, df[cols].to_numpy()):
-        for d in row:
-            cont[int(d)] += float(w)
-    return sorted([d for d, _ in cont.most_common(top_n)])
+    arr = df[cols].to_numpy(dtype=np.int64)
+    if arr.size == 0:
+        return []
+    n, k = arr.shape
+
+    # Mais recente => maior peso (assumindo df em ordem cronológica crescente)
+    pesos = np.geomspace(0.01, 1.0, num=n).astype(np.float64)
+
+    rows = np.repeat(np.arange(n, dtype=np.int64), k)
+    vals = arr.ravel()
+    mask = vals >= 0
+    vals = vals[mask]
+    w = pesos[rows[mask]]
+
+    cont = np.bincount(vals, weights=w, minlength=int(vals.max()) + 1).astype(np.float64)
+    nums = np.arange(cont.size, dtype=np.int64)
+    order = np.lexsort((nums, -cont))
+    escolhidos = nums[order][: int(top_n)]
+    return sorted(int(x) for x in escolhidos.tolist())
 
 
-# ---------- ML base ----------
-def _preparar_ml(df: pd.DataFrame, tipo_loteria: str) -> Tuple[np.ndarray, np.ndarray, int]:
+# ---------- ML base (mais eficiente + prevê o PRÓXIMO sorteio de verdade) ----------
+def _binarizar_sorteios(arr: np.ndarray, max_d: int) -> np.ndarray:
+    """
+    Converte matriz (n_sorteios, k_dezenas) em matriz binária (n_sorteios, max_d+1).
+    """
+    arr = np.asarray(arr, dtype=np.int64)
+    n, k = arr.shape
+    B = np.zeros((n, max_d + 1), dtype=np.uint8)
+
+    rows = np.repeat(np.arange(n, dtype=np.int64), k)
+    vals = arr.ravel()
+    mask = (vals >= 0) & (vals <= max_d)
+    B[rows[mask], vals[mask]] = 1
+    return B
+
+
+def _preparar_ml(
+    df: pd.DataFrame, tipo_loteria: str
+) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     cols = [c for c in df.columns if c.startswith("num_")]
-    arr = df[cols].astype(int)
+    arr = df[cols].astype(int).to_numpy(dtype=np.int64)
     max_d = _max_num_por_tipo(tipo_loteria, df)
 
-    X: List[List[int]] = []
-    Y: List[List[int]] = []
+    if arr.shape[0] < 2:
+        vazio = np.empty((0, max_d + 1), dtype=np.float32)
+        return vazio, vazio, max_d, np.zeros((max_d + 1,), dtype=np.float32)
 
-    if len(arr) < 2:
-        return np.asarray(X), np.asarray(Y), max_d
+    B = _binarizar_sorteios(arr, max_d=max_d)  # (n_sorteios, max_d+1)
 
-    for i in range(len(arr) - 1):
-        atual = arr.iloc[i].tolist()
-        prox = arr.iloc[i + 1].tolist()
+    # Labels: próximo sorteio (i -> i+1)
+    Y = B[1:].astype(np.uint8)
 
-        linha = [0] * (max_d + 1)
-        for d in atual:
-            if 0 <= d <= max_d:
-                linha[int(d)] = 1
+    # Features: janela lookback até o sorteio atual
+    L = int(max(1, _LOTO_LOOKBACK))
+    cumsum = np.cumsum(B, axis=0, dtype=np.int16)
+    cumsum_pad = np.vstack([np.zeros((1, max_d + 1), dtype=np.int16), cumsum])
 
-        prox_limpo = [int(x) for x in prox if 0 <= int(x) <= max_d]
-        Y.append(sorted(set(prox_limpo)))
-        X.append(linha)
+    # X para pares (i -> i+1), i = 0..n-2
+    n_pairs = B.shape[0] - 1
+    ends = np.arange(n_pairs, dtype=np.int64)  # 0..n-2
+    starts = np.maximum(0, ends - (L - 1))
+    X = (cumsum_pad[ends + 1] - cumsum_pad[starts]).astype(np.float32)
 
-    if not X or not Y:
-        return np.asarray(X), np.asarray(Y), max_d
+    # x_pred: usa o último sorteio real (e lookback) para prever o próximo
+    end_last = B.shape[0] - 1
+    start_last = max(0, end_last - (L - 1))
+    x_pred = (cumsum_pad[end_last + 1] - cumsum_pad[start_last]).astype(np.float32)
 
-    mlb = MultiLabelBinarizer(classes=list(range(max_d + 1)))
-    y_bin = mlb.fit_transform(Y)
-    return np.asarray(X), y_bin, max_d
+    return X, Y, max_d, x_pred
+
+
+def _estrato_proxy(Y: np.ndarray) -> np.ndarray:
+    """
+    StratifiedKFold precisa de uma classe 1D com contagens mínimas por classe.
+    Para multilabel, usamos proxy estável: bins por quantis do maior número do target.
+    """
+    y_max = Y.argmax(axis=1).astype(np.int64)
+    if y_max.size < 30:
+        return y_max
+
+    qs = np.quantile(y_max, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    bins = np.unique(qs)
+    if bins.size < 3:
+        return y_max
+    return np.digitize(y_max, bins[1:-1], right=True).astype(np.int64)
 
 
 def _avaliar_modelo(clf, X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
-    if len(X) < 3:
+    if len(X) < 10:
         return 0.0, 0.0
 
-    y_estrato = Y.argmax(axis=1)
-    kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    y_estrato = _estrato_proxy(Y)
+
+    # n_splits seguro
+    counts = np.bincount(y_estrato) if y_estrato.size else np.array([0], dtype=np.int64)
+    min_count = int(counts.min()) if counts.size else 0
+    n_splits = min(_LOTO_CV_SPLITS, 5, min_count) if min_count >= 3 else 3
+    n_splits = max(3, min(n_splits, len(X)))
+
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=_RANDOM_STATE)
 
     f1s: List[float] = []
     accs: List[float] = []
@@ -271,7 +345,7 @@ def _avaliar_modelo(clf, X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
         y_train, y_test = Y[train_idx], Y[test_idx]
         clf.fit(X_train, y_train)
         pred = clf.predict(X_test)
-        f1s.append(f1_score(y_test, pred, average="micro"))
+        f1s.append(f1_score(y_test, pred, average="micro", zero_division=0))
         accs.append(accuracy_score(y_test, pred))
 
     return float(np.mean(f1s)), float(np.mean(accs))
@@ -291,21 +365,51 @@ def _selecionar_top_dezenas_por_scores(
     """
     _, _, min_num = _limites_dezenas_por_tipo(tipo_loteria)
 
-    scores = np.asarray(scores).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     if scores.shape[0] > max_d + 1:
         scores = scores[: max_d + 1]
+    elif scores.shape[0] < max_d + 1:
+        pad_val = float(scores.min()) if scores.size else 0.0
+        scores = np.pad(scores, (0, (max_d + 1) - scores.shape[0]), constant_values=pad_val)
 
     if min_num == 0:
-        # 0..max_d
         idx = np.argsort(scores)[-top_n:][::-1]
         dezenas = [int(i) for i in idx]
         return sorted(dezenas)[:top_n]
 
-    # 1..max_d
     scores_sem_zero = scores[1:]
     idx = np.argsort(scores_sem_zero)[-top_n:][::-1]
     dezenas = [int(i + 1) for i in idx]
     return sorted(dezenas)[:top_n]
+
+
+def _extrair_scores(model, x_pred: np.ndarray, max_d: int) -> np.ndarray:
+    """
+    Unifica saída de:
+      - OneVsRest (array shape [n_classes])
+      - Multioutput (lista de arrays por saída)
+    """
+    try:
+        proba = model.predict_proba(x_pred)
+        if isinstance(proba, list):
+            # multioutput => lista; cada item: (n_samples, n_classes)
+            out = np.empty((len(proba),), dtype=np.float64)
+            for i, p in enumerate(proba):
+                if p.ndim == 2 and p.shape[1] >= 2:
+                    out[i] = float(p[0, 1])
+                else:
+                    out[i] = float(p[0, 0]) if p.size else 0.0
+            return out
+        return np.asarray(proba[0], dtype=np.float64)
+    except Exception:
+        try:
+            df = model.decision_function(x_pred)
+            if isinstance(df, list):
+                out = np.asarray([float(d[0]) for d in df], dtype=np.float64)
+                return out
+            return np.asarray(df[0], dtype=np.float64)
+        except Exception:
+            return np.random.default_rng(_RANDOM_STATE).random(max_d + 1)
 
 
 def _rank_por_modelo(
@@ -314,8 +418,9 @@ def _rank_por_modelo(
     base_estimator,
     tipo_loteria: str,
     nome_modelo: str,
+    usar_ovr: bool,
 ) -> Tuple[List[int], float]:
-    X, Y, max_d = _preparar_ml(df, tipo_loteria)
+    X, Y, max_d, x_pred_vec = _preparar_ml(df, tipo_loteria)
 
     if len(X) < 10 or Y.size == 0:
         return predizer_por_frequencia(df, top_n), 0.0
@@ -336,11 +441,16 @@ def _rank_por_modelo(
             melhor_score = 0.0
             melhor_pipeline = None
 
+    usar_pca = X.shape[1] >= 10 and X.shape[0] >= 30
+    pca_step = PCA(n_components=0.95) if usar_pca else "passthrough"
+
+    clf_step = OneVsRestClassifier(base_estimator, n_jobs=-1) if usar_ovr else base_estimator
+
     pipeline_novo = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=min(0.95, X.shape[1]))),
-            ("clf", OneVsRestClassifier(base_estimator)),
+            ("pca", pca_step),
+            ("clf", clf_step),
         ]
     )
 
@@ -361,16 +471,14 @@ def _rank_por_modelo(
             "n_features": int(X.shape[1]),
             "max_num": int(max_d),
             "n_samples": int(len(X)),
+            "lookback": int(_LOTO_LOOKBACK),
+            "ovr": bool(usar_ovr),
         },
     )
 
-    try:
-        scores = melhor_pipeline.predict_proba(X)[-1]
-    except Exception:
-        try:
-            scores = melhor_pipeline.decision_function(X)[-1]
-        except Exception:
-            scores = np.random.rand(max_d + 1)
+    # Previsão do PRÓXIMO sorteio: usa o último sorteio real como entrada
+    x_pred = np.asarray(x_pred_vec, dtype=np.float32).reshape(1, -1)
+    scores = _extrair_scores(melhor_pipeline, x_pred, max_d=max_d)
 
     dezenas = _selecionar_top_dezenas_por_scores(scores, top_n, tipo_loteria, max_d)
     return dezenas, float(melhor_score)
@@ -380,44 +488,52 @@ def _rank_por_modelo(
 def predizer_random_forest(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    # Multioutput nativo (bem mais eficiente que OneVsRest para dezenas/classes)
     clf = RandomForestClassifier(
-        n_estimators=400,
+        n_estimators=_LOTO_RF_N_ESTIMATORS,
         max_depth=None,
         n_jobs=-1,
-        random_state=42,
+        random_state=_RANDOM_STATE,
+        bootstrap=True,
     )
-    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "random_forest")
+    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "random_forest", usar_ovr=False)
 
 
 def predizer_logistic(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    # OneVsRest necessário; solver saga usa múltiplos cores (n_jobs)
     clf = LogisticRegression(
-        max_iter=3000,
-        solver="lbfgs",
-        random_state=42,
+        max_iter=12000,
+        solver="saga",
+        penalty="l2",
+        n_jobs=-1,
+        random_state=_RANDOM_STATE,
     )
-    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "logistic_regression")
+    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "logistic_regression", usar_ovr=True)
 
 
 def predizer_knn(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    # Multioutput nativo
     clf = KNeighborsClassifier(
-        n_neighbors=5,
+        n_neighbors=7,
         weights="distance",
+        n_jobs=-1,
     )
-    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "k_nearest_neighbors")
+    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "k_nearest_neighbors", usar_ovr=False)
 
 
 def predizer_gb(df: pd.DataFrame, top_n: int, tipo_loteria: str) -> Tuple[List[int], float]:
+    # GradientBoosting não é multioutput => OneVsRest
     clf = GradientBoostingClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
+        n_estimators=_LOTO_GB_N_ESTIMATORS,
+        learning_rate=0.03,
         max_depth=5,
-        random_state=42,
+        random_state=_RANDOM_STATE,
     )
-    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "gradient_boosting")
+    return _rank_por_modelo(df, top_n, clf, tipo_loteria, "gradient_boosting", usar_ovr=True)
 
 
 # ---------- geração de jogos ----------
@@ -603,6 +719,10 @@ def gerar_palpite(
         "max_dezenas": int(max_dez),
         "min_num": int(min_num),
         "max_num": int(max_num),
+        "lookback_usado": int(_LOTO_LOOKBACK),
+        "cv_splits_max": int(_LOTO_CV_SPLITS),
+        "rf_n_estimators": int(_LOTO_RF_N_ESTIMATORS),
+        "gb_n_estimators": int(_LOTO_GB_N_ESTIMATORS),
     }
     if avisos:
         resultados["avisos"] = avisos
@@ -626,4 +746,10 @@ res = gerar_palpite(df, "mega sena")
 res = gerar_palpite(df, "mega sena", n_jogos=5, n_dezenas=9)
 
 print(res["jogos_sugeridos"])
+
+# Para “forçar” mais processamento (sem editar o arquivo):
+#   export LOTO_RF_N_ESTIMATORS=2500
+#   export LOTO_GB_N_ESTIMATORS=1500
+#   export LOTO_CV_SPLITS=7
+#   export LOTO_LOOKBACK=5
 """
