@@ -30,13 +30,15 @@ from PyQt6.QtWidgets import (
 from coleta import ColetorThread
 from predicao import carregar_dados, gerar_palpite, _carregar_historico
 
-LOTERIAS = ["Mega Sena", "Lotofacil", "Quina", "Lotomania"]
+# --- Atualizado: inclui Super Sete ---
+LOTERIAS = ["Mega Sena", "Lotofacil", "Quina", "Lotomania", "Super Sete"]
 
 DEFAULT_DEZENAS_POR_LOTERIA = {
     "Mega Sena": 6,
     "Lotofacil": 15,
     "Quina": 5,
     "Lotomania": 50,
+    "Super Sete": 7,
 }
 
 LIMITES_DEZENAS_POR_LOTERIA = {
@@ -44,12 +46,21 @@ LIMITES_DEZENAS_POR_LOTERIA = {
     "Lotofacil": (15, 20),
     "Quina": (5, 15),
     "Lotomania": (50, 50),
+    "Super Sete": (7, 7),
 }
+
+
+def _is_super_sete(loteria: str) -> bool:
+    t = (loteria or "").lower()
+    return ("super" in t) and ("sete" in t)
 
 
 def _format_dezenas(loteria: str, dezenas: List[int]) -> str:
     if "lotomania" in loteria.lower():
         return ", ".join(f"{int(d):02d}" for d in dezenas)
+    if _is_super_sete(loteria):
+        # Super Sete: dígitos 0..9 (mostrar como 0..9, sem zero à esquerda obrigatório)
+        return " ".join(str(int(d)) for d in dezenas)
     return ", ".join(str(int(d)) for d in dezenas)
 
 
@@ -147,10 +158,9 @@ class App(QWidget):
         self.setWindowIcon(QIcon("loteria.ico"))
 
         self.setMinimumSize(980, 560)
-        self.resize(1050, 600)
+        self.resize(1080, 620)
 
         self._last_default_dezenas: int | None = None
-
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -211,6 +221,11 @@ class App(QWidget):
         self.input_n_dezenas.setMaxLength(3)
         self.input_n_dezenas.setPlaceholderText("Ex.: 15")
 
+        # Pequena melhoria: Enter nos campos dispara ação (opcional e sem quebrar)
+        self.input_qtd.returnPressed.connect(self.iniciar_coleta)
+        self.input_n_jogos.returnPressed.connect(self.predizer_jogo)
+        self.input_n_dezenas.returnPressed.connect(self.predizer_jogo)
+
         grid.addWidget(lbl_loteria, 0, 0)
         grid.addWidget(self.combo_loteria, 0, 1)
         grid.addWidget(lbl_concursos, 0, 2)
@@ -237,15 +252,24 @@ class App(QWidget):
         self.btn_predizer = QPushButton("🧠 Prever Jogo Ideal")
         self.btn_predizer.clicked.connect(self.predizer_jogo)
 
+        # Pequena melhoria: botão limpar log
+        self.btn_limpar_log = QPushButton("🧹 Limpar Log")
+        self.btn_limpar_log.clicked.connect(self._limpar_log)
+
         self.btn_coletar.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self.btn_predizer.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
+        self.btn_limpar_log.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.btn_limpar_log.setFixedWidth(140)
 
         row.addWidget(self.btn_coletar)
         row.addWidget(self.btn_predizer)
+        row.addWidget(self.btn_limpar_log)
         return row
 
     def _build_bottom_splitter(self) -> QSplitter:
@@ -289,6 +313,7 @@ class App(QWidget):
         return splitter
 
     def _apply_style(self) -> None:
+        # Pequenas melhorias visuais: foco, seleção, scrollbar e bordas mais suaves.
         self.setStyleSheet(
             """
             QWidget {
@@ -298,15 +323,15 @@ class App(QWidget):
             }
 
             QLabel#Title {
-                font-size: 18px;
-                font-weight: 700;
+                font-size: 19px;
+                font-weight: 800;
                 color: #FFFFFF;
                 padding: 6px 0;
             }
 
             QGroupBox {
                 border: 1px solid #2E2E2E;
-                border-radius: 10px;
+                border-radius: 12px;
                 margin-top: 8px;
                 padding: 10px;
                 background: #1B1B1B;
@@ -316,29 +341,33 @@ class App(QWidget):
                 left: 10px;
                 padding: 0 6px;
                 color: #FFFFFF;
-                font-weight: 700;
+                font-weight: 800;
             }
 
             QLineEdit, QComboBox {
-                height: 28px;
-                border-radius: 8px;
+                height: 30px;
+                border-radius: 9px;
                 border: 1px solid #2C2C2C;
                 background: #101010;
                 padding: 0 10px;
                 color: #FFFFFF;
+                selection-background-color: #444444;
+            }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
+                border: 1px solid #4A4A4A;
             }
 
             QComboBox::drop-down {
                 border: 0px;
-                width: 24px;
+                width: 26px;
             }
 
             QPushButton {
-                height: 34px;
-                border-radius: 10px;
+                height: 36px;
+                border-radius: 11px;
                 border: 1px solid #2C2C2C;
                 background: #222222;
-                font-weight: 700;
+                font-weight: 800;
             }
             QPushButton:hover { background: #2A2A2A; }
             QPushButton:pressed { background: #1F1F1F; }
@@ -350,17 +379,17 @@ class App(QWidget):
 
             QProgressBar {
                 border: 1px solid #2C2C2C;
-                border-radius: 10px;
+                border-radius: 11px;
                 text-align: center;
                 background: #101010;
             }
             QProgressBar::chunk {
-                border-radius: 10px;
+                border-radius: 11px;
                 background: #3A3A3A;
             }
 
             QTextEdit {
-                border-radius: 10px;
+                border-radius: 12px;
                 border: 1px solid #2C2C2C;
                 background: #0B0B0B;
                 color: #FFFFFF;
@@ -370,20 +399,22 @@ class App(QWidget):
             }
 
             QTableWidget {
-                border-radius: 10px;
+                border-radius: 12px;
                 border: 1px solid #2C2C2C;
                 background: #111111;
                 color: #FFFFFF;
                 gridline-color: #2A2A2A;
+                selection-background-color: #2A2A2A;
+                selection-color: #FFFFFF;
             }
             QHeaderView::section {
                 background-color: #222222;
                 color: #FFFFFF;
-                font-weight: 700;
+                font-weight: 800;
                 border: 0px;
-                padding: 6px;
+                padding: 7px;
             }
-        """
+            """
         )
 
     def _sync_defaults_and_limits(self) -> None:
@@ -403,11 +434,17 @@ class App(QWidget):
         )
         if "lotomania" in loteria.lower():
             tooltip += "\nObs.: dezenas exibidas como 00..99 (inclui 00)."
+        if _is_super_sete(loteria):
+            tooltip += "\nObs.: Super Sete = 7 dígitos (0..9) por posição, pode repetir."
 
         self.input_n_dezenas.setToolTip(tooltip)
 
         atual = self.input_n_dezenas.text().strip()
-        if not atual or (self._last_default_dezenas is not None and atual.isdigit() and int(atual) == self._last_default_dezenas):
+        if not atual or (
+            self._last_default_dezenas is not None
+            and atual.isdigit()
+            and int(atual) == self._last_default_dezenas
+        ):
             self.input_n_dezenas.setText(str(default_dezenas))
 
         self._last_default_dezenas = int(default_dezenas)
@@ -421,6 +458,7 @@ class App(QWidget):
             QMessageBox.critical(self, "Erro", "Quantidade inválida.")
             return
 
+        self._set_busy(True)
         self.log_area.clear()
         self.progress.setValue(0)
         self._append_log("🚀 Iniciando coleta...")
@@ -432,6 +470,8 @@ class App(QWidget):
         self.thread.start()
 
     def _finalizar_coleta(self, df: pd.DataFrame) -> None:
+        self._set_busy(False)
+
         if df.empty:
             self._append_log("⚠️ Nenhum resultado encontrado.")
             QMessageBox.warning(self, "Aviso", "Nenhum resultado foi coletado.")
@@ -479,6 +519,7 @@ class App(QWidget):
             if n_dezenas is not None:
                 self.input_n_dezenas.setText(str(n_dezenas))
 
+        self._set_busy(True)
         self._append_log("🧩 Preparando predição em segundo plano...")
         self.progress.setValue(0)
 
@@ -491,6 +532,7 @@ class App(QWidget):
         self.pred_thread.log.connect(self._append_log)
         self.pred_thread.progresso.connect(self.progress.setValue)
         self.pred_thread.resultado.connect(self._exibir_resultado)
+        self.pred_thread.finished.connect(lambda: self._set_busy(False))
         self.pred_thread.start()
 
     # ---------- exibição ----------
@@ -536,22 +578,31 @@ class App(QWidget):
                 continue
 
             if chave == "melhor_combinacao":
-                self._append_log(f"🎯 Melhor combinação: {_format_dezenas(self.combo_loteria.currentText(), nums)}\n")
+                self._append_log(
+                    f"🎯 Melhor combinação: {_format_dezenas(self.combo_loteria.currentText(), nums)}\n"
+                )
             else:
-                self._append_log(f"• {chave}: {_format_dezenas(self.combo_loteria.currentText(), nums)}")
+                self._append_log(
+                    f"• {chave}: {_format_dezenas(self.combo_loteria.currentText(), nums)}"
+                )
 
         jogos = palpites.get("jogos_sugeridos", [])
         if jogos:
             self._append_log("\n🎟️ Jogos sugeridos:")
             for i, jogo in enumerate(jogos, start=1):
-                self._append_log(f"  Jogo {i}: {_format_jogo(self.combo_loteria.currentText(), jogo)}")
+                self._append_log(
+                    f"  Jogo {i}: {_format_jogo(self.combo_loteria.currentText(), jogo)}"
+                )
             self._append_log("")
 
         self._atualizar_tabela_desempenho(palpites)
 
         if jogos:
             texto = "\n".join(
-                [f"Jogo {i}: {_format_jogo(self.combo_loteria.currentText(), j)}" for i, j in enumerate(jogos, 1)]
+                [
+                    f"Jogo {i}: {_format_jogo(self.combo_loteria.currentText(), j)}"
+                    for i, j in enumerate(jogos, 1)
+                ]
             )
             QMessageBox.information(self, "Previsão Concluída", f"Jogos sugeridos:\n{texto}")
             return
@@ -607,9 +658,7 @@ class App(QWidget):
             item_modelo = QTableWidgetItem(modelo)
             item_hist = QTableWidgetItem(f"{hist_pct:.2f}%")
             item_atual = QTableWidgetItem(f"{atual_pct:.2f}%")
-            item_evol = QTableWidgetItem(
-                f"{emoji} {delta_pp:+.2f} p.p. / {delta_pct_rel:+.2f}%"
-            )
+            item_evol = QTableWidgetItem(f"{emoji} {delta_pp:+.2f} p.p. / {delta_pct_rel:+.2f}%")
 
             for item in (item_modelo, item_hist, item_atual, item_evol):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -640,10 +689,23 @@ class App(QWidget):
                 f"| Evolução relativa: {melhor_delta_pct_rel:+.2f}%"
             )
 
-    # ---------- log helper ----------
+    # ---------- helpers ----------
     def _append_log(self, msg: str) -> None:
         self.log_area.append(msg)
         self.log_area.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _limpar_log(self) -> None:
+        self.log_area.clear()
+        self._append_log("🧹 Log limpo.")
+
+    def _set_busy(self, busy: bool) -> None:
+        # Pequena melhoria: bloqueia ações enquanto roda thread
+        self.btn_coletar.setDisabled(busy)
+        self.btn_predizer.setDisabled(busy)
+        self.combo_loteria.setDisabled(busy)
+        self.input_qtd.setDisabled(busy)
+        self.input_n_jogos.setDisabled(busy)
+        self.input_n_dezenas.setDisabled(busy)
 
 
 if __name__ == "__main__":

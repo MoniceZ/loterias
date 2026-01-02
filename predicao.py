@@ -14,6 +14,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.multiclass import OneVsRestClassifier
+from sklearn.multioutput import MultiOutputClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -33,6 +34,11 @@ _LOTO_GB_N_ESTIMATORS = int(np.clip(int(__import__("os").environ.get("LOTO_GB_N_
 
 
 # ---------- util ----------
+def _is_super_sete(tipo_loteria: str) -> bool:
+    t = (tipo_loteria or "").lower()
+    return ("super" in t) and ("sete" in t)
+
+
 def _top_n_por_tipo(tipo_loteria: str) -> int:
     t = tipo_loteria.lower()
     if "facil" in t:
@@ -43,6 +49,8 @@ def _top_n_por_tipo(tipo_loteria: str) -> int:
         return 5
     if "lotomania" in t:
         return 50
+    if _is_super_sete(tipo_loteria):
+        return 7
     return 20
 
 
@@ -53,6 +61,7 @@ def _limites_dezenas_por_tipo(tipo_loteria: str) -> Tuple[int, int, int]:
     min_num:
       - 1 na maioria (dezenas 1..N)
       - 0 na Lotomania (00..99 -> 0..99)
+      - 0 no Super Sete (0..9 por coluna)
     """
     t = tipo_loteria.lower()
 
@@ -65,6 +74,8 @@ def _limites_dezenas_por_tipo(tipo_loteria: str) -> Tuple[int, int, int]:
         return 5, 15, 1
     if "lotomania" in t:
         return 50, 50, 0
+    if _is_super_sete(tipo_loteria):
+        return 7, 7, 0
 
     # fallback genérico
     return 1, 60, 1
@@ -213,6 +224,8 @@ def _max_num_por_tipo(tipo_loteria: str, df: pd.DataFrame) -> int:
         return 80
     if "lotomania" in t:
         return 99
+    if _is_super_sete(tipo_loteria):
+        return 9
 
     cols = [c for c in df.columns if c.startswith("num_")]
     arr = df[cols].astype(int).to_numpy()
@@ -254,6 +267,58 @@ def predizer_por_recencia(df: pd.DataFrame, top_n: int) -> List[int]:
     order = np.lexsort((nums, -cont))
     escolhidos = nums[order][: int(top_n)]
     return sorted(int(x) for x in escolhidos.tolist())
+
+
+# ---------- Super Sete (heurísticas por POSIÇÃO) ----------
+def _cols_num(df: pd.DataFrame) -> List[str]:
+    return sorted([c for c in df.columns if c.startswith("num_")])
+
+
+def predizer_supersete_por_frequencia(df: pd.DataFrame) -> List[int]:
+    cols = _cols_num(df)
+    if not cols:
+        return []
+    arr = df[cols].to_numpy(dtype=np.int64)
+    if arr.size == 0:
+        return []
+    palp: List[int] = []
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        col = col[(col >= 0) & (col <= 9)]
+        if col.size == 0:
+            palp.append(0)
+            continue
+        cont = np.bincount(col, minlength=10).astype(np.float64)
+        m = cont.max()
+        candidatos = np.flatnonzero(cont == m)
+        palp.append(int(candidatos.min()) if candidatos.size else 0)
+    return palp
+
+
+def predizer_supersete_por_recencia(df: pd.DataFrame) -> List[int]:
+    cols = _cols_num(df)
+    if not cols:
+        return []
+    arr = df[cols].to_numpy(dtype=np.int64)
+    if arr.size == 0:
+        return []
+    n = arr.shape[0]
+    pesos = np.geomspace(0.01, 1.0, num=n).astype(np.float64)
+
+    palp: List[int] = []
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        mask = (col >= 0) & (col <= 9)
+        colv = col[mask]
+        w = pesos[mask]
+        if colv.size == 0:
+            palp.append(0)
+            continue
+        cont = np.bincount(colv, weights=w, minlength=10).astype(np.float64)
+        m = cont.max()
+        candidatos = np.flatnonzero(cont == m)
+        palp.append(int(candidatos.min()) if candidatos.size else 0)
+    return palp
 
 
 # ---------- ML base (mais eficiente + prevê o PRÓXIMO sorteio de verdade) ----------
@@ -307,6 +372,46 @@ def _preparar_ml(
     return X, Y, max_d, x_pred
 
 
+# ---------- ML Super Sete (por posição, 7 saídas 0..9) ----------
+def _preparar_ml_supersete(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+    cols = _cols_num(df)
+    arr = df[cols].astype(int).to_numpy(dtype=np.int64)
+    max_d = 9
+
+    if arr.shape[0] < 2:
+        vazioX = np.empty((0, 70), dtype=np.float32)
+        vazioY = np.empty((0, 7), dtype=np.int64)
+        return vazioX, vazioY, max_d, np.zeros((70,), dtype=np.float32)
+
+    # One-hot por posição: (n, 7*10)
+    n = arr.shape[0]
+    B = np.zeros((n, 70), dtype=np.uint8)
+    for i in range(n):
+        for pos in range(min(7, arr.shape[1])):
+            v = int(arr[i, pos])
+            if 0 <= v <= 9:
+                B[i, pos * 10 + v] = 1
+
+    # Labels: próximo sorteio (i -> i+1) como inteiros por posição
+    Y = arr[1:, :7].astype(np.int64)
+
+    # Features: janela lookback (soma de one-hots)
+    L = int(max(1, _LOTO_LOOKBACK))
+    cumsum = np.cumsum(B, axis=0, dtype=np.int16)
+    cumsum_pad = np.vstack([np.zeros((1, 70), dtype=np.int16), cumsum])
+
+    n_pairs = B.shape[0] - 1
+    ends = np.arange(n_pairs, dtype=np.int64)  # 0..n-2
+    starts = np.maximum(0, ends - (L - 1))
+    X = (cumsum_pad[ends + 1] - cumsum_pad[starts]).astype(np.float32)
+
+    end_last = B.shape[0] - 1
+    start_last = max(0, end_last - (L - 1))
+    x_pred = (cumsum_pad[end_last + 1] - cumsum_pad[start_last]).astype(np.float32)
+
+    return X, Y, max_d, x_pred
+
+
 def _estrato_proxy(Y: np.ndarray) -> np.ndarray:
     """
     StratifiedKFold precisa de uma classe 1D com contagens mínimas por classe.
@@ -347,6 +452,38 @@ def _avaliar_modelo(clf, X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
         pred = clf.predict(X_test)
         f1s.append(f1_score(y_test, pred, average="micro", zero_division=0))
         accs.append(accuracy_score(y_test, pred))
+
+    return float(np.mean(f1s)), float(np.mean(accs))
+
+
+def _avaliar_modelo_supersete(clf, X: np.ndarray, Y: np.ndarray) -> Tuple[float, float]:
+    # Y shape: (n, 7), classes: 0..9
+    if len(X) < 10 or Y.size == 0:
+        return 0.0, 0.0
+
+    y_proxy = Y[:, 0].astype(np.int64)  # estratifica pelo 1º dígito (0..9)
+    counts = np.bincount(y_proxy, minlength=10)
+    counts_nonzero = counts[counts > 0]
+    if counts_nonzero.size == 0:
+        return 0.0, 0.0
+    min_count = int(counts_nonzero.min())
+
+    n_splits = min(_LOTO_CV_SPLITS, 5, min_count, len(X))
+    n_splits = max(2, n_splits)
+
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=_RANDOM_STATE)
+
+    f1s: List[float] = []
+    accs: List[float] = []
+
+    for train_idx, test_idx in kf.split(X, y_proxy):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = Y[train_idx], Y[test_idx]
+        clf.fit(X_train, y_train)
+        pred = clf.predict(X_test)
+
+        f1s.append(f1_score(y_test.ravel(), pred.ravel(), average="micro", zero_division=0))
+        accs.append(float((pred == y_test).mean()))
 
     return float(np.mean(f1s)), float(np.mean(accs))
 
@@ -410,6 +547,86 @@ def _extrair_scores(model, x_pred: np.ndarray, max_d: int) -> np.ndarray:
             return np.asarray(df[0], dtype=np.float64)
         except Exception:
             return np.random.default_rng(_RANDOM_STATE).random(max_d + 1)
+
+
+def _extrair_scores_supersete(model, x_pred: np.ndarray) -> List[np.ndarray]:
+    """
+    Retorna lista de 7 vetores de score (len=10) para cada posição.
+    """
+    # Descobrir o estimador final (pipeline ou estimator direto)
+    clf = model
+    if hasattr(model, "named_steps"):
+        clf = model.named_steps.get("clf", model)
+
+    try:
+        proba = model.predict_proba(x_pred)
+    except Exception:
+        # fallback: aleatório estável
+        rng = np.random.default_rng(_RANDOM_STATE)
+        return [rng.random(10) for _ in range(7)]
+
+    if not isinstance(proba, list):
+        # inesperado; tenta coerção
+        proba_list = [np.asarray(proba, dtype=np.float64)]
+    else:
+        proba_list = proba
+
+    # classes por saída, quando disponível
+    classes_list = None
+    if hasattr(clf, "classes_"):
+        classes_list = clf.classes_
+    elif hasattr(clf, "estimators_"):
+        try:
+            classes_list = [est.classes_ for est in clf.estimators_]
+        except Exception:
+            classes_list = None
+
+    scores_out: List[np.ndarray] = []
+    for i in range(7):
+        # proba[i]: (n_samples, n_classes_i)
+        if i >= len(proba_list):
+            scores_out.append(np.zeros(10, dtype=np.float64))
+            continue
+
+        p = np.asarray(proba_list[i], dtype=np.float64)
+        if p.ndim == 2:
+            p = p[0]
+        p = p.reshape(-1)
+
+        scores = np.zeros(10, dtype=np.float64)
+        if classes_list is not None and i < len(classes_list):
+            try:
+                cls = np.asarray(classes_list[i], dtype=np.int64).reshape(-1)
+                for c, s in zip(cls.tolist(), p.tolist()):
+                    if 0 <= int(c) <= 9:
+                        scores[int(c)] = float(s)
+            except Exception:
+                # fallback simples: mapeia na ordem 0..len(p)-1
+                for c in range(min(10, p.size)):
+                    scores[c] = float(p[c])
+        else:
+            for c in range(min(10, p.size)):
+                scores[c] = float(p[c])
+
+        scores_out.append(scores)
+
+    # garante 7 posições
+    while len(scores_out) < 7:
+        scores_out.append(np.zeros(10, dtype=np.float64))
+
+    return scores_out
+
+
+def _selecionar_digitos_supersete(scores_list: List[np.ndarray]) -> List[int]:
+    palp: List[int] = []
+    for sc in scores_list[:7]:
+        sc = np.asarray(sc, dtype=np.float64).reshape(-1)
+        if sc.size < 10:
+            sc = np.pad(sc, (0, 10 - sc.size), constant_values=float(sc.min()) if sc.size else 0.0)
+        m = float(sc.max()) if sc.size else 0.0
+        cand = np.flatnonzero(sc == m)
+        palp.append(int(cand.min()) if cand.size else 0)
+    return palp
 
 
 def _rank_por_modelo(
@@ -484,10 +701,88 @@ def _rank_por_modelo(
     return dezenas, float(melhor_score)
 
 
+def _rank_por_modelo_supersete(
+    df: pd.DataFrame,
+    base_estimator,
+    tipo_loteria: str,
+    nome_modelo: str,
+) -> Tuple[List[int], float]:
+    X, Y, max_d, x_pred_vec = _preparar_ml_supersete(df)
+
+    if len(X) < 10 or Y.size == 0:
+        return predizer_supersete_por_frequencia(df), 0.0
+
+    salvo = _tentar_carregar_modelo(tipo_loteria, nome_modelo)
+    pipeline_antigo = salvo.get("pipeline") if isinstance(salvo, dict) else None
+    n_features_salvo = salvo.get("n_features") if isinstance(salvo, dict) else None
+
+    melhor_pipeline = None
+    melhor_score = 0.0
+
+    if pipeline_antigo is not None and n_features_salvo == X.shape[1]:
+        try:
+            f1_old, acc_old = _avaliar_modelo_supersete(pipeline_antigo, X, Y)
+            melhor_score = (f1_old + acc_old) / 2.0
+            melhor_pipeline = pipeline_antigo
+        except Exception:
+            melhor_score = 0.0
+            melhor_pipeline = None
+
+    usar_pca = X.shape[1] >= 10 and X.shape[0] >= 30
+    pca_step = PCA(n_components=0.95) if usar_pca else "passthrough"
+
+    pipeline_novo = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("pca", pca_step),
+            ("clf", base_estimator),
+        ]
+    )
+
+    f1_new, acc_new = _avaliar_modelo_supersete(pipeline_novo, X, Y)
+    score_novo = (f1_new + acc_new) / 2.0
+
+    if score_novo >= melhor_score:
+        melhor_score = score_novo
+        melhor_pipeline = pipeline_novo
+
+    melhor_pipeline.fit(X, Y)
+
+    _salvar_modelo(
+        tipo_loteria,
+        nome_modelo,
+        {
+            "pipeline": melhor_pipeline,
+            "n_features": int(X.shape[1]),
+            "max_num": int(max_d),
+            "n_samples": int(len(X)),
+            "lookback": int(_LOTO_LOOKBACK),
+            "ovr": False,
+            "supersete": True,
+        },
+    )
+
+    x_pred = np.asarray(x_pred_vec, dtype=np.float32).reshape(1, -1)
+    scores_list = _extrair_scores_supersete(melhor_pipeline, x_pred)
+    palp = _selecionar_digitos_supersete(scores_list)
+
+    return palp, float(melhor_score)
+
+
 # ---------- modelos ----------
 def predizer_random_forest(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    if _is_super_sete(tipo_loteria):
+        clf = RandomForestClassifier(
+            n_estimators=_LOTO_RF_N_ESTIMATORS,
+            max_depth=None,
+            n_jobs=-1,
+            random_state=_RANDOM_STATE,
+            bootstrap=True,
+        )
+        return _rank_por_modelo_supersete(df, clf, tipo_loteria, "random_forest")
+
     # Multioutput nativo (bem mais eficiente que OneVsRest para dezenas/classes)
     clf = RandomForestClassifier(
         n_estimators=_LOTO_RF_N_ESTIMATORS,
@@ -502,6 +797,17 @@ def predizer_random_forest(
 def predizer_logistic(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    if _is_super_sete(tipo_loteria):
+        base = LogisticRegression(
+            max_iter=12000,
+            solver="saga",
+            penalty="l2",
+            n_jobs=-1,
+            random_state=_RANDOM_STATE,
+        )
+        clf = MultiOutputClassifier(base, n_jobs=-1)
+        return _rank_por_modelo_supersete(df, clf, tipo_loteria, "logistic_regression")
+
     # OneVsRest necessário; solver saga usa múltiplos cores (n_jobs)
     clf = LogisticRegression(
         max_iter=12000,
@@ -516,6 +822,14 @@ def predizer_logistic(
 def predizer_knn(
     df: pd.DataFrame, top_n: int, tipo_loteria: str
 ) -> Tuple[List[int], float]:
+    if _is_super_sete(tipo_loteria):
+        clf = KNeighborsClassifier(
+            n_neighbors=7,
+            weights="distance",
+            n_jobs=-1,
+        )
+        return _rank_por_modelo_supersete(df, clf, tipo_loteria, "k_nearest_neighbors")
+
     # Multioutput nativo
     clf = KNeighborsClassifier(
         n_neighbors=7,
@@ -526,6 +840,16 @@ def predizer_knn(
 
 
 def predizer_gb(df: pd.DataFrame, top_n: int, tipo_loteria: str) -> Tuple[List[int], float]:
+    if _is_super_sete(tipo_loteria):
+        base = GradientBoostingClassifier(
+            n_estimators=_LOTO_GB_N_ESTIMATORS,
+            learning_rate=0.03,
+            max_depth=5,
+            random_state=_RANDOM_STATE,
+        )
+        clf = MultiOutputClassifier(base, n_jobs=-1)
+        return _rank_por_modelo_supersete(df, clf, tipo_loteria, "gradient_boosting")
+
     # GradientBoosting não é multioutput => OneVsRest
     clf = GradientBoostingClassifier(
         n_estimators=_LOTO_GB_N_ESTIMATORS,
@@ -626,6 +950,30 @@ def _gerar_jogos_sugeridos(
     return jogos
 
 
+def _gerar_jogos_sugeridos_supersete(
+    votos_pos: List[Counter[int]],
+    n_jogos: int,
+) -> List[List[int]]:
+    if n_jogos < 1:
+        n_jogos = 1
+
+    rankings: List[List[int]] = []
+    for pos in range(7):
+        c = votos_pos[pos] if pos < len(votos_pos) else Counter()
+        ranking = sorted(range(0, 10), key=lambda d: (-float(c.get(d, 0.0)), d))
+        rankings.append(ranking)
+
+    jogos: List[List[int]] = []
+    for i in range(n_jogos):
+        jogo: List[int] = []
+        for pos in range(7):
+            rank = rankings[pos]
+            idx = (i + pos) % len(rank)
+            jogo.append(int(rank[idx]))
+        jogos.append(jogo)
+    return jogos
+
+
 # ---------- orquestra ----------
 def gerar_palpite(
     df: pd.DataFrame,
@@ -642,7 +990,106 @@ def gerar_palpite(
       - Ajusta automaticamente n_dezenas para respeitar o mínimo/máximo por loteria
         (ex.: Lotofácil mínimo 15).
       - Lotomania permite 0 (00) nas dezenas.
+
+    Super Sete:
+      - Trata por posição (7 dígitos 0..9), permitindo repetição.
     """
+    # --- Super Sete: fluxo próprio (por posição) ---
+    if _is_super_sete(tipo_loteria):
+        max_num = 9
+        top_n, min_dez, max_dez, min_num, avisos = _ajustar_n_dezenas(
+            tipo_loteria=tipo_loteria,
+            n_dezenas=n_dezenas,
+            max_num=max_num,
+        )
+
+        historico = _carregar_historico()
+
+        freq = predizer_supersete_por_frequencia(df)
+        rec = predizer_supersete_por_recencia(df)
+
+        rf, rf_acc = predizer_random_forest(df, top_n, tipo_loteria)
+        lg, lg_acc = predizer_logistic(df, top_n, tipo_loteria)
+        kn, kn_acc = predizer_knn(df, top_n, tipo_loteria)
+        gb, gb_acc = predizer_gb(df, top_n, tipo_loteria)
+
+        resultados: Dict[str, Any] = {
+            "frequencia_simples": freq,
+            "recencia_ponderada": rec,
+            "random_forest": rf,
+            "logistic_regression": lg,
+            "k_nearest_neighbors": kn,
+            "gradient_boosting": gb,
+        }
+
+        desempenho = {
+            "random_forest": rf_acc,
+            "logistic_regression": lg_acc,
+            "k_nearest_neighbors": kn_acc,
+            "gradient_boosting": gb_acc,
+        }
+
+        pesos_modelos: Dict[str, float] = {
+            "frequencia_simples": 0.5,
+            "recencia_ponderada": 0.8,
+            "random_forest": 1.0 + (rf_acc + historico.get("random_forest", 1.0)) / 2.0,
+            "logistic_regression": (
+                0.9 + (lg_acc + historico.get("logistic_regression", 1.0)) / 2.0
+            ),
+            "k_nearest_neighbors": (
+                0.8 + (kn_acc + historico.get("k_nearest_neighbors", 1.0)) / 2.0
+            ),
+            "gradient_boosting": (
+                1.1 + (gb_acc + historico.get("gradient_boosting", 1.0)) / 2.0
+            ),
+        }
+
+        votos_pos: List[Counter[int]] = [Counter() for _ in range(7)]
+        for nome, lista in resultados.items():
+            peso = float(pesos_modelos.get(nome, 1.0))
+            if not isinstance(lista, list):
+                continue
+            for pos in range(min(7, len(lista))):
+                votos_pos[pos][int(lista[pos])] += peso
+
+        melhores: List[int] = []
+        for pos in range(7):
+            c = votos_pos[pos]
+            if not c:
+                melhores.append(0)
+                continue
+            ranking = sorted(range(0, 10), key=lambda d: (-float(c.get(d, 0.0)), d))
+            melhores.append(int(ranking[0]))
+
+        resultados["melhor_combinacao"] = melhores
+        resultados["avaliacao_modelos"] = {k: float(round(v, 4)) for k, v in desempenho.items()}
+
+        resultados["jogos_sugeridos"] = _gerar_jogos_sugeridos_supersete(
+            votos_pos=votos_pos,
+            n_jogos=max(1, int(n_jogos)),
+        )
+
+        resultados["parametros"] = {
+            "tipo_loteria": tipo_loteria,
+            "n_jogos": int(max(1, int(n_jogos))),
+            "n_dezenas_solicitada": None if n_dezenas is None else int(n_dezenas),
+            "n_dezenas_usada": int(top_n),
+            "min_dezenas": int(min_dez),
+            "max_dezenas": int(max_dez),
+            "min_num": int(min_num),
+            "max_num": int(max_num),
+            "lookback_usado": int(_LOTO_LOOKBACK),
+            "cv_splits_max": int(_LOTO_CV_SPLITS),
+            "rf_n_estimators": int(_LOTO_RF_N_ESTIMATORS),
+            "gb_n_estimators": int(_LOTO_GB_N_ESTIMATORS),
+        }
+        if avisos:
+            resultados["avisos"] = avisos
+
+        _salvar_historico(tipo_loteria, desempenho)
+        return resultados
+
+    # --- Fluxo original (demais loterias) ---
     max_num = _max_num_por_tipo(tipo_loteria, df)
     top_n, min_dez, max_dez, min_num, avisos = _ajustar_n_dezenas(
         tipo_loteria=tipo_loteria,

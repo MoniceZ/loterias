@@ -22,7 +22,16 @@ def _slugify(texto: str) -> str:
     return sem_acentos.lower().strip()
 
 
+def _is_super_sete(loteria_nome: str) -> bool:
+    loteria = _slugify(loteria_nome)
+    return ("super" in loteria) and ("sete" in loteria)
+
+
 def gerar_url(loteria_nome: str) -> str:
+    # ✅ Super Sete tem URL diferente
+    if _is_super_sete(loteria_nome):
+        return "https://asloterias.com.br/todos-resultados-super-sete"
+
     slug = _slugify(loteria_nome).replace("+", "mais").replace(" ", "-")
     return f"https://asloterias.com.br/lista-de-resultados-da-{slug}"
 
@@ -37,6 +46,8 @@ def obter_max_dezenas(loteria_nome: str) -> int:
         return 5
     if "lotomania" in loteria:
         return 50
+    if _is_super_sete(loteria_nome):
+        return 7
     return 20
 
 
@@ -89,6 +100,9 @@ def calcular_estatisticas_loteria(df: pd.DataFrame, loteria_nome: str) -> pd.Dat
         universo = list(range(1, 81))
     elif "lotomania" in loteria:
         universo = list(range(0, 100))
+    elif _is_super_sete(loteria_nome):
+        # Super Sete: dígitos 0..9
+        universo = list(range(0, 10))
     else:
         universo = list(range(int(numeros.min()), int(numeros.max()) + 1))
 
@@ -217,6 +231,7 @@ class ColetorThread(QThread):
         self.cfg = cfg or ColetaConfig()
         self.url = gerar_url(loteria_nome)
         self.max_dezenas = obter_max_dezenas(loteria_nome)
+        self._super_sete = _is_super_sete(loteria_nome)
 
     def run(self) -> None:
         self.log.emit("🟡 Inicializando WebDriver...")
@@ -228,54 +243,112 @@ class ColetorThread(QThread):
             driver.get(self.url)
 
             wait = WebDriverWait(driver, self.cfg.timeout_s)
-            wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "strong")))
-
-            elementos = driver.find_elements(By.TAG_NAME, "strong")
-            self.log.emit(f"🔎 {len(elementos)} concursos encontrados na página.")
 
             resultados: List[Dict[str, str | int]] = []
-            rx_data = re.compile(r"\d{2}/\d{2}/\d{4}")
-            rx_dezenas = re.compile(r"\d{2}")
-
             total_alvo = max(self.quantidade, 1)
 
-            for strong in elementos:
-                concurso = strong.text.strip()
-                if not concurso.isdigit():
-                    continue
+            if self._super_sete:
+                # ✅ Super Sete (URL nova): parse por texto da página (robusto ao layout)
+                wait.until(lambda d: "Concurso:" in d.find_element(By.TAG_NAME, "body").text)
 
-                texto = driver.execute_script(
-                    """
-                    const el = arguments[0];
-                    let node = el.nextSibling;
-                    while (node && node.nodeType !== Node.TEXT_NODE) node = node.nextSibling;
-                    return node ? node.textContent.trim() : "";
-                    """,
-                    strong,
-                )
-                if not texto:
-                    continue
+                body_text = driver.find_element(By.TAG_NAME, "body").text
 
-                m_data = rx_data.search(texto)
-                dezenas = rx_dezenas.findall(texto)
+                rx_header = re.compile(r"Concurso:\s*(\d+)\s*-\s*(\d{2}/\d{2}/\d{4})")
+                rx_col = re.compile(r"Col:\s*([1-7])\s*(?:\r?\n|\s)+(\d{2})")
 
-                if not m_data or len(dezenas) < self.max_dezenas:
-                    continue
+                # opcional: contagem para log
+                try:
+                    total_headers = len(rx_header.findall(body_text))
+                    self.log.emit(f"🔎 {total_headers} concursos detectados na página.")
+                except Exception:
+                    self.log.emit("🔎 Concursos detectados na página.")
 
-                data = m_data.group(0)
-                ultimas = dezenas[-self.max_dezenas :]
-                row: Dict[str, str | int] = {"concurso": int(concurso), "data": data}
-                for j, dez in enumerate(ultimas, 1):
-                    row[f"num_{j:02d}"] = int(dez)
+                it = rx_header.finditer(body_text)
+                m1 = next(it, None)
 
-                resultados.append(row)
+                while m1 is not None and len(resultados) < total_alvo:
+                    m2 = next(it, None)
+                    start = m1.start()
+                    end = m2.start() if m2 is not None else len(body_text)
 
-                progresso = int(min(100, (len(resultados) / total_alvo) * 100))
-                self.progresso.emit(progresso)
-                self.log.emit(f"✅ Concurso {concurso} coletado.")
+                    bloco = body_text[start:end]
+                    concurso = m1.group(1)
+                    data = m1.group(2)
 
-                if len(resultados) >= total_alvo:
-                    break
+                    cols_map: Dict[int, int] = {}
+                    for cm in rx_col.finditer(bloco):
+                        cols_map[int(cm.group(1))] = int(cm.group(2))
+
+                    if len(cols_map) < self.max_dezenas:
+                        m1 = m2
+                        continue
+
+                    row: Dict[str, str | int] = {"concurso": int(concurso), "data": data}
+                    ok = True
+                    for j in range(1, self.max_dezenas + 1):
+                        if j not in cols_map:
+                            ok = False
+                            break
+                        row[f"num_{j:02d}"] = int(cols_map[j])
+                    if not ok:
+                        m1 = m2
+                        continue
+
+                    resultados.append(row)
+
+                    progresso = int(min(100, (len(resultados) / total_alvo) * 100))
+                    self.progresso.emit(progresso)
+                    self.log.emit(f"✅ Concurso {concurso} coletado.")
+
+                    m1 = m2
+
+            else:
+                # Demais loterias: mantém o comportamento atual (lista por <strong>)
+                wait.until(EC.presence_of_all_elements_located((By.TAG_NAME, "strong")))
+
+                elementos = driver.find_elements(By.TAG_NAME, "strong")
+                self.log.emit(f"🔎 {len(elementos)} concursos encontrados na página.")
+
+                rx_data = re.compile(r"\d{2}/\d{2}/\d{4}")
+                rx_dezenas = re.compile(r"\d{2}")
+
+                for strong in elementos:
+                    concurso = strong.text.strip()
+                    if not concurso.isdigit():
+                        continue
+
+                    texto = driver.execute_script(
+                        """
+                        const el = arguments[0];
+                        let node = el.nextSibling;
+                        while (node && node.nodeType !== Node.TEXT_NODE) node = node.nextSibling;
+                        return node ? node.textContent.trim() : "";
+                        """,
+                        strong,
+                    )
+                    if not texto:
+                        continue
+
+                    m_data = rx_data.search(texto)
+                    dezenas = rx_dezenas.findall(texto)
+
+                    if not m_data or len(dezenas) < self.max_dezenas:
+                        continue
+
+                    data = m_data.group(0)
+                    ultimas = dezenas[-self.max_dezenas :]
+                    row: Dict[str, str | int] = {"concurso": int(concurso), "data": data}
+                    for j, dez in enumerate(ultimas, 1):
+                        row[f"num_{j:02d}"] = int(dez)
+
+                    resultados.append(row)
+
+                    progresso = int(min(100, (len(resultados) / total_alvo) * 100))
+                    self.progresso.emit(progresso)
+                    self.log.emit(f"✅ Concurso {concurso} coletado.")
+
+                    if len(resultados) >= total_alvo:
+                        break
 
             df = pd.DataFrame(resultados)
             self.finalizado.emit(df)
