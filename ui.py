@@ -9,6 +9,7 @@ from PyQt6.QtGui import QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHeaderView,
@@ -136,12 +137,20 @@ class PreditorThread(QThread):
             self.progresso.emit(0)
 
             df = carregar_dados(self.arquivo_csv)
+            self.progresso.emit(3)
+            self.log.emit("Dados carregados. Preparando calculos...")
+
+            def _reportar_progresso(valor: int, mensagem: str = "") -> None:
+                self.progresso.emit(int(valor))
+                if mensagem:
+                    self.log.emit(mensagem)
 
             palpites = gerar_palpite(
                 df,
                 self.loteria,
                 n_jogos=self.n_jogos,
                 n_dezenas=self.n_dezenas,
+                progress_callback=_reportar_progresso,
             )
 
             self.progresso.emit(100)
@@ -161,6 +170,7 @@ class App(QWidget):
         self.resize(1080, 620)
 
         self._last_default_dezenas: int | None = None
+        self._ultimo_resultado: dict | None = None
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -181,6 +191,12 @@ class App(QWidget):
         self.progress.setFormat("%p%")
         self.progress.setFixedHeight(26)
         root.addWidget(self.progress)
+
+        self.alerta_dados = QLabel("")
+        self.alerta_dados.setObjectName("AlertBanner")
+        self.alerta_dados.setVisible(False)
+        self.alerta_dados.setWordWrap(True)
+        root.addWidget(self.alerta_dados)
 
         splitter = self._build_bottom_splitter()
         root.addWidget(splitter)
@@ -252,6 +268,10 @@ class App(QWidget):
         self.btn_predizer = QPushButton("🧠 Prever Jogo Ideal")
         self.btn_predizer.clicked.connect(self.predizer_jogo)
 
+        self.btn_salvar_relatorio = QPushButton("Salvar Relatorio")
+        self.btn_salvar_relatorio.clicked.connect(self.salvar_relatorio)
+        self.btn_salvar_relatorio.setDisabled(True)
+
         # Pequena melhoria: botão limpar log
         self.btn_limpar_log = QPushButton("🧹 Limpar Log")
         self.btn_limpar_log.clicked.connect(self._limpar_log)
@@ -262,13 +282,18 @@ class App(QWidget):
         self.btn_predizer.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
+        self.btn_salvar_relatorio.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.btn_limpar_log.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
+        self.btn_salvar_relatorio.setFixedWidth(150)
         self.btn_limpar_log.setFixedWidth(140)
 
         row.addWidget(self.btn_coletar)
         row.addWidget(self.btn_predizer)
+        row.addWidget(self.btn_salvar_relatorio)
         row.addWidget(self.btn_limpar_log)
         return row
 
@@ -288,6 +313,7 @@ class App(QWidget):
         log_box.setLayout(log_layout)
 
         perf_box = QGroupBox("📊 Desempenho dos Modelos (F1/Acc médios)")
+        perf_box.setTitle("Score dos Modelos (validacao temporal)")
         perf_layout = QVBoxLayout()
         perf_layout.setContentsMargins(10, 12, 10, 10)
 
@@ -327,6 +353,15 @@ class App(QWidget):
                 font-weight: 800;
                 color: #FFFFFF;
                 padding: 6px 0;
+            }
+
+            QLabel#AlertBanner {
+                border: 1px solid #6A5420;
+                border-radius: 10px;
+                background: #2A2211;
+                color: #F7E6B5;
+                padding: 10px 12px;
+                font-weight: 700;
             }
 
             QGroupBox {
@@ -537,6 +572,9 @@ class App(QWidget):
 
     # ---------- exibição ----------
     def _exibir_resultado(self, palpites: dict) -> None:
+        self._ultimo_resultado = dict(palpites)
+        self.btn_salvar_relatorio.setDisabled(False)
+        self._atualizar_alerta_dados(palpites.get("alertas_dados", []))
         self._append_log("✅ Predição concluída!\n")
 
         avisos = palpites.get("avisos", [])
@@ -561,6 +599,33 @@ class App(QWidget):
                     self.input_n_dezenas.setText(str(int(usada)))
                 except Exception:
                     pass
+
+        metodo_avaliacao = palpites.get("avaliacao_metodo")
+        if isinstance(metodo_avaliacao, str) and metodo_avaliacao.strip():
+            self._append_log(f"ðŸ“ AvaliaÃ§Ã£o: {metodo_avaliacao}")
+
+        alertas_dados = palpites.get("alertas_dados", [])
+        if isinstance(alertas_dados, list) and alertas_dados:
+            for alerta in alertas_dados:
+                if isinstance(alerta, dict):
+                    self._append_log(
+                        f"Alerta de dados: {alerta.get('titulo', 'Alerta')} - {alerta.get('mensagem', '')}"
+                    )
+
+        resumo_modelos = palpites.get("resumo_modelos", {})
+        if isinstance(resumo_modelos, dict) and resumo_modelos.get("melhor_modelo"):
+            self._append_log(
+                f"ðŸ§­ Resumo: melhor modelo={resumo_modelos.get('melhor_modelo')} "
+                f"| score={float(resumo_modelos.get('score_melhor_modelo', 0.0)) * 100.0:.2f}% "
+                f"| confianca relativa={float(resumo_modelos.get('confianca_relativa', 0.0)) * 100.0:.2f}%"
+            )
+
+        pesos_modelos = palpites.get("pesos_modelos", {})
+        if isinstance(pesos_modelos, dict) and pesos_modelos:
+            pesos_txt = ", ".join(
+                f"{nome}={float(valor):.2f}" for nome, valor in pesos_modelos.items()
+            )
+            self._append_log(f"âš–ï¸ Pesos do ensemble: {pesos_txt}")
 
         etapas = [
             "frequencia_simples",
@@ -689,6 +754,117 @@ class App(QWidget):
                 f"| Evolução relativa: {melhor_delta_pct_rel:+.2f}%"
             )
 
+    def _atualizar_tabela_desempenho(self, palpites: dict) -> None:
+        historico = palpites.get("historico_modelos", {})
+        if not isinstance(historico, dict) or not historico:
+            historico = _carregar_historico(self.combo_loteria.currentText())
+
+        atual = palpites.get("avaliacao_modelos", {})
+        detalhado = palpites.get("avaliacao_detalhada", {})
+
+        self.table_perf.setRowCount(0)
+
+        if not atual:
+            self._append_log("Sem metricas de desempenho disponiveis.")
+            return
+
+        rotulos_metricas = {
+            "score_composto": "Score composto",
+            "taxa_acerto": "Taxa de acerto",
+            "precisao_aposta": "Precisao da aposta",
+            "jaccard": "Jaccard",
+            "f1_micro": "F1 micro",
+            "acuracia_exata": "Acuracia exata",
+            "f1_ponderado": "F1 ponderado",
+            "acerto_4_mais": "Acerto 4+",
+            "acerto_exato": "Acerto exato",
+            "acertos_medios": "Acertos medios",
+            "amostras_avaliadas": "Amostras",
+        }
+        metricas_percentuais = {
+            "score_composto",
+            "taxa_acerto",
+            "precisao_aposta",
+            "jaccard",
+            "f1_micro",
+            "acuracia_exata",
+            "f1_ponderado",
+            "acerto_4_mais",
+            "acerto_exato",
+        }
+
+        melhor_modelo = None
+        melhor_score_atual = -1.0
+        melhor_hist = 0.0
+        melhor_delta_pct_rel = 0.0
+
+        for modelo in atual.keys():
+            score_atual = float(atual.get(modelo, 0.0))
+            score_hist = float(historico.get(modelo, 0.0))
+
+            hist_pct = score_hist * 100.0
+            atual_pct = score_atual * 100.0
+            delta_pp = atual_pct - hist_pct
+            delta_pct_rel = (delta_pp / hist_pct) * 100.0 if hist_pct > 0 else 0.0
+
+            if score_hist == 0 and score_atual > 0:
+                emoji = "NEW"
+            elif delta_pp > 0:
+                emoji = "UP"
+            elif delta_pp < 0:
+                emoji = "DOWN"
+            else:
+                emoji = "EQ"
+
+            detalhes_modelo = detalhado.get(modelo, {})
+            tooltip_linhas = [
+                f"Historico: {hist_pct:.2f}%",
+                f"Atual: {atual_pct:.2f}%",
+                f"Variacao: {delta_pp:+.2f} p.p. ({delta_pct_rel:+.2f}%)",
+            ]
+            if isinstance(detalhes_modelo, dict):
+                for chave, valor in detalhes_modelo.items():
+                    rotulo = rotulos_metricas.get(chave, chave.replace("_", " ").title())
+                    if chave in metricas_percentuais:
+                        tooltip_linhas.append(f"{rotulo}: {float(valor) * 100.0:.2f}%")
+                    elif chave == "amostras_avaliadas":
+                        tooltip_linhas.append(f"{rotulo}: {int(float(valor))}")
+                    else:
+                        tooltip_linhas.append(f"{rotulo}: {float(valor):.2f}")
+            tooltip = "\n".join(tooltip_linhas)
+
+            linha = self.table_perf.rowCount()
+            self.table_perf.insertRow(linha)
+
+            item_modelo = QTableWidgetItem(modelo)
+            item_hist = QTableWidgetItem(f"{hist_pct:.2f}%")
+            item_atual = QTableWidgetItem(f"{atual_pct:.2f}%")
+            item_evol = QTableWidgetItem(f"{emoji} {delta_pp:+.2f} p.p. / {delta_pct_rel:+.2f}%")
+
+            for item in (item_modelo, item_hist, item_atual, item_evol):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(tooltip)
+
+            self.table_perf.setItem(linha, 0, item_modelo)
+            self.table_perf.setItem(linha, 1, item_hist)
+            self.table_perf.setItem(linha, 2, item_atual)
+            self.table_perf.setItem(linha, 3, item_evol)
+
+            if score_atual > melhor_score_atual:
+                melhor_score_atual = score_atual
+                melhor_modelo = modelo
+                melhor_hist = score_hist
+                melhor_delta_pct_rel = delta_pct_rel
+
+        if melhor_modelo is not None:
+            hist_pct = melhor_hist * 100.0
+            atual_pct = melhor_score_atual * 100.0
+            self._append_log(
+                f"Melhor modelo no momento: {melhor_modelo} "
+                f"-> Score atual: {atual_pct:.2f}% | Historico: {hist_pct:.2f}% "
+                f"| Evolucao relativa: {melhor_delta_pct_rel:+.2f}%"
+            )
+
     # ---------- helpers ----------
     def _append_log(self, msg: str) -> None:
         self.log_area.append(msg)
@@ -698,6 +874,101 @@ class App(QWidget):
         self.log_area.clear()
         self._append_log("🧹 Log limpo.")
 
+    def _atualizar_alerta_dados(self, alertas: list) -> None:
+        if not isinstance(alertas, list) or not alertas:
+            self.alerta_dados.clear()
+            self.alerta_dados.setVisible(False)
+            return
+
+        alertas_validos = [a for a in alertas if isinstance(a, dict)]
+        if not alertas_validos:
+            self.alerta_dados.clear()
+            self.alerta_dados.setVisible(False)
+            return
+
+        prioridade = {"warning": 2, "info": 1}
+        principal = sorted(
+            alertas_validos,
+            key=lambda a: prioridade.get(str(a.get("nivel", "info")), 0),
+            reverse=True,
+        )[0]
+
+        nivel = str(principal.get("nivel", "info"))
+        titulo = str(principal.get("titulo", "Alerta"))
+        mensagem = str(principal.get("mensagem", ""))
+        self.alerta_dados.setText(f"{titulo}: {mensagem}")
+        self.alerta_dados.setVisible(True)
+
+        if nivel == "warning":
+            self.alerta_dados.setStyleSheet(
+                "border: 1px solid #8A5A12; border-radius: 10px; background: #33240F; "
+                "color: #FFD889; padding: 10px 12px; font-weight: 700;"
+            )
+        else:
+            self.alerta_dados.setStyleSheet(
+                "border: 1px solid #33556E; border-radius: 10px; background: #162633; "
+                "color: #B9E4FF; padding: 10px 12px; font-weight: 700;"
+            )
+
+    def salvar_relatorio(self) -> None:
+        if not isinstance(self._ultimo_resultado, dict) or not self._ultimo_resultado:
+            QMessageBox.information(self, "Relatorio", "Nenhuma previsao para salvar ainda.")
+            return
+
+        loteria = self.combo_loteria.currentText().replace(" ", "_").replace("+", "mais")
+        caminho_sugerido = str(Path.cwd() / f"{loteria}_ultimo_relatorio.txt")
+        caminho, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar relatorio",
+            caminho_sugerido,
+            "Arquivos de texto (*.txt)",
+        )
+        if not caminho:
+            return
+
+        linhas: List[str] = [f"Loteria: {self.combo_loteria.currentText()}"]
+        params = self._ultimo_resultado.get("parametros", {})
+        if isinstance(params, dict):
+            linhas.append(f"Jogos gerados: {params.get('n_jogos', '-')}")
+            linhas.append(f"Dezenas usadas: {params.get('n_dezenas_usada', '-')}")
+
+        metodo = self._ultimo_resultado.get("avaliacao_metodo")
+        if isinstance(metodo, str) and metodo.strip():
+            linhas.extend(["", f"Avaliacao: {metodo}"])
+
+        for chave in [
+            "frequencia_simples",
+            "recencia_ponderada",
+            "random_forest",
+            "logistic_regression",
+            "k_nearest_neighbors",
+            "gradient_boosting",
+            "melhor_combinacao",
+        ]:
+            nums = self._ultimo_resultado.get(chave, [])
+            if nums:
+                linhas.append(
+                    f"{chave}: {_format_dezenas(self.combo_loteria.currentText(), nums)}"
+                )
+
+        jogos = self._ultimo_resultado.get("jogos_sugeridos", [])
+        if jogos:
+            linhas.extend(["", "Jogos sugeridos:"])
+            for i, jogo in enumerate(jogos, start=1):
+                linhas.append(
+                    f"Jogo {i}: {_format_jogo(self.combo_loteria.currentText(), jogo)}"
+                )
+
+        avaliacao = self._ultimo_resultado.get("avaliacao_modelos", {})
+        if isinstance(avaliacao, dict) and avaliacao:
+            linhas.extend(["", "Score dos modelos:"])
+            for nome, score in avaliacao.items():
+                linhas.append(f"{nome}: {float(score) * 100.0:.2f}%")
+
+        Path(caminho).write_text("\n".join(linhas), encoding="utf-8")
+        self._append_log(f"Relatorio salvo em: {Path(caminho).name}")
+        QMessageBox.information(self, "Relatorio", "Relatorio salvo com sucesso.")
+
     def _set_busy(self, busy: bool) -> None:
         # Pequena melhoria: bloqueia ações enquanto roda thread
         self.btn_coletar.setDisabled(busy)
@@ -706,6 +977,12 @@ class App(QWidget):
         self.input_qtd.setDisabled(busy)
         self.input_n_jogos.setDisabled(busy)
         self.input_n_dezenas.setDisabled(busy)
+        if busy:
+            self.alerta_dados.setVisible(False)
+        if busy:
+            self.btn_salvar_relatorio.setDisabled(True)
+        elif isinstance(self._ultimo_resultado, dict) and self._ultimo_resultado:
+            self.btn_salvar_relatorio.setDisabled(False)
 
 
 if __name__ == "__main__":
