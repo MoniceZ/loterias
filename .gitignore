@@ -1,7 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Local runtime data
 *.csv
+*.joblib
+modelos/
 
-__pycache__
+# Build artifacts
+build/
+dist/
 
-.vscode
-
-modelos
+# Environment files
+.env
+.env.*

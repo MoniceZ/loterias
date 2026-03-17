@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app_paths import icon_path, resolve_resultados_csv_path, resultados_csv_path
 from coleta import ColetorThread
 from predicao import carregar_dados, gerar_palpite, _carregar_historico
 
@@ -164,7 +165,7 @@ class App(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Previsor de Loterias Inteligente")
-        self.setWindowIcon(QIcon("loteria.ico"))
+        self.setWindowIcon(QIcon(str(icon_path())))
 
         self.setMinimumSize(980, 560)
         self.resize(1080, 620)
@@ -512,8 +513,8 @@ class App(QWidget):
             QMessageBox.warning(self, "Aviso", "Nenhum resultado foi coletado.")
             return
 
-        nome_base = self.combo_loteria.currentText().replace(" ", "_").replace("+", "mais")
-        saida = Path(f"{nome_base}_resultados.csv")
+        loteria = self.combo_loteria.currentText()
+        saida = resultados_csv_path(loteria)
         df.to_csv(saida, index=False, encoding="utf-8-sig")
         self._append_log(f"💾 {len(df)} concursos salvos em {saida.name}")
         QMessageBox.information(self, "Sucesso", f"{len(df)} concursos salvos com sucesso.")
@@ -521,8 +522,7 @@ class App(QWidget):
     # ---------- predição ----------
     def predizer_jogo(self) -> None:
         loteria = self.combo_loteria.currentText()
-        nome_base = loteria.replace(" ", "_").replace("+", "mais")
-        arquivo_csv = Path(f"{nome_base}_resultados.csv")
+        arquivo_csv = resolve_resultados_csv_path(loteria)
 
         if not arquivo_csv.exists():
             QMessageBox.critical(self, "Erro", "Você precisa coletar os dados primeiro.")
@@ -630,6 +630,7 @@ class App(QWidget):
         etapas = [
             "frequencia_simples",
             "recencia_ponderada",
+            "algoritmo_evolutivo",
             "random_forest",
             "logistic_regression",
             "k_nearest_neighbors",
@@ -939,6 +940,7 @@ class App(QWidget):
         for chave in [
             "frequencia_simples",
             "recencia_ponderada",
+            "algoritmo_evolutivo",
             "random_forest",
             "logistic_regression",
             "k_nearest_neighbors",

@@ -4,10 +4,12 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
 from joblib import dump, load
+import sklearn
 from sklearn.decomposition import PCA
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -17,6 +19,13 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from app_paths import (
+    bundled_historico_modelos_path,
+    bundled_modelos_dir,
+    historico_modelos_path,
+    writable_modelos_dir,
+)
 
 # =========================
 # Tuning (sem mudar API)
@@ -30,10 +39,17 @@ _LOTO_LOOKBACK = int(np.clip(int(__import__("os").environ.get("LOTO_LOOKBACK", "
 _LOTO_CV_SPLITS = int(np.clip(int(__import__("os").environ.get("LOTO_CV_SPLITS", "5")), 3, 10))
 _LOTO_RF_N_ESTIMATORS = int(np.clip(int(__import__("os").environ.get("LOTO_RF_N_ESTIMATORS", "1200")), 200, 5000))
 _LOTO_GB_N_ESTIMATORS = int(np.clip(int(__import__("os").environ.get("LOTO_GB_N_ESTIMATORS", "800")), 100, 5000))
+_LOTO_GA_POP_SIZE = int(np.clip(int(__import__("os").environ.get("LOTO_GA_POP_SIZE", "500")), 60, 5000))
+_LOTO_GA_GENERATIONS = int(np.clip(int(__import__("os").environ.get("LOTO_GA_GENERATIONS", "200")), 10, 3000))
+_LOTO_GA_TOURNAMENTS = int(np.clip(int(__import__("os").environ.get("LOTO_GA_TOURNAMENTS", "250")), 20, 5000))
+_LOTO_GA_MUTATION_RATE = float(
+    np.clip(float(__import__("os").environ.get("LOTO_GA_MUTATION_RATE", "0.05")), 0.0, 1.0)
+)
 
 _MODELOS_AVALIADOS = (
     "frequencia_simples",
     "recencia_ponderada",
+    "algoritmo_evolutivo",
     "random_forest",
     "logistic_regression",
     "k_nearest_neighbors",
@@ -158,10 +174,31 @@ def carregar_dados(caminho_csv: str | Path) -> pd.DataFrame:
     return _ordenar_dataframe_temporalmente(df)
 
 
+def _resolver_historico_leitura(caminho: str | Path | None = None) -> Path:
+    if caminho is not None:
+        return Path(caminho)
+
+    caminho_usuario = historico_modelos_path()
+    if caminho_usuario.exists():
+        return caminho_usuario
+
+    caminho_bundle = bundled_historico_modelos_path()
+    if caminho_bundle.exists():
+        return caminho_bundle
+
+    return caminho_usuario
+
+
+def _resolver_historico_escrita(caminho: str | Path | None = None) -> Path:
+    if caminho is not None:
+        return Path(caminho)
+    return historico_modelos_path()
+
+
 def _salvar_historico(
     tipo_loteria: str,
     desempenho: Dict[str, float],
-    caminho: str = "historico_modelos.csv",
+    caminho: str | Path | None = None,
 ) -> None:
     """Salva ou atualiza o histórico de desempenho em CSV."""
     data = {
@@ -170,11 +207,14 @@ def _salvar_historico(
     }
     data.update(desempenho)
 
-    historico_path = Path(caminho)
+    historico_path = _resolver_historico_escrita(caminho)
     df_novo = pd.DataFrame([data])
 
     if historico_path.exists():
         df_antigo = pd.read_csv(historico_path)
+        df_final = pd.concat([df_antigo, df_novo], ignore_index=True)
+    elif caminho is None and bundled_historico_modelos_path().exists():
+        df_antigo = pd.read_csv(bundled_historico_modelos_path())
         df_final = pd.concat([df_antigo, df_novo], ignore_index=True)
     else:
         df_final = df_novo
@@ -182,12 +222,12 @@ def _salvar_historico(
     df_final.to_csv(historico_path, index=False)
 
 
-def _carregar_historico(caminho: str = "historico_modelos.csv") -> Dict[str, float]:
+def _carregar_historico(caminho: str | Path | None = None) -> Dict[str, float]:
     """
     Retorna médias históricas de desempenho dos modelos (ou pesos padrão
     se não existir histórico).
     """
-    p = Path(caminho)
+    p = _resolver_historico_leitura(caminho)
     if not p.exists():
         return {
             "random_forest": 1.0,
@@ -221,7 +261,7 @@ def _carregar_historico(caminho: str = "historico_modelos.csv") -> Dict[str, flo
 # ---------- persistência de modelos ----------
 def _carregar_historico(
     tipo_loteria: str | None = None,
-    caminho: str = "historico_modelos.csv",
+    caminho: str | Path | None = None,
 ) -> Dict[str, float]:
     """
     Retorna mÃ©dias histÃ³ricas de desempenho dos modelos.
@@ -230,7 +270,7 @@ def _carregar_historico(
     loteria para evitar misturar desempenhos de jogos diferentes.
     """
     medias = {nome: 0.0 for nome in _MODELOS_AVALIADOS}
-    p = Path(caminho)
+    p = _resolver_historico_leitura(caminho)
 
     if not p.exists():
         return medias
@@ -273,23 +313,38 @@ def _slug_tipo(tipo_loteria: str) -> str:
 
 def _modelo_path(tipo_loteria: str, nome_modelo: str) -> Path:
     slug = _slug_tipo(tipo_loteria)
-    return Path("modelos") / f"{slug}_{nome_modelo}.joblib"
+    return writable_modelos_dir() / f"{slug}_{nome_modelo}.joblib"
+
+
+def _modelo_bundle_path(tipo_loteria: str, nome_modelo: str) -> Path:
+    slug = _slug_tipo(tipo_loteria)
+    return bundled_modelos_dir() / f"{slug}_{nome_modelo}.joblib"
 
 
 def _salvar_modelo(tipo_loteria: str, nome_modelo: str, payload: dict) -> None:
     caminho = _modelo_path(tipo_loteria, nome_modelo)
     caminho.parent.mkdir(parents=True, exist_ok=True)
-    dump(payload, caminho)
+    payload_final = dict(payload)
+    payload_final.setdefault("sklearn_version", sklearn.__version__)
+    dump(payload_final, caminho)
 
 
 def _tentar_carregar_modelo(tipo_loteria: str, nome_modelo: str) -> dict | None:
-    caminho = _modelo_path(tipo_loteria, nome_modelo)
-    if not caminho.exists():
-        return None
-    try:
-        return load(caminho)
-    except Exception:
-        return None
+    for caminho in (_modelo_path(tipo_loteria, nome_modelo), _modelo_bundle_path(tipo_loteria, nome_modelo)):
+        if not caminho.exists():
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                payload = load(caminho)
+            if isinstance(payload, dict):
+                versao_modelo = str(payload.get("sklearn_version", "") or "").strip()
+                if versao_modelo and versao_modelo != sklearn.__version__:
+                    continue
+            return payload
+        except Exception:
+            continue
+    return None
 
 
 def _max_num_por_tipo(tipo_loteria: str, df: pd.DataFrame) -> int:
@@ -400,6 +455,304 @@ def predizer_supersete_por_recencia(df: pd.DataFrame) -> List[int]:
 
 
 # ---------- ML base (mais eficiente + prevê o PRÓXIMO sorteio de verdade) ----------
+def _janela_evolutiva(df: pd.DataFrame, tamanho: int = 10) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    return df.tail(max(2, int(tamanho))).reset_index(drop=True)
+
+
+def _atrasos_por_numero(df: pd.DataFrame, universo: List[int]) -> Dict[int, int]:
+    cols = [c for c in df.columns if c.startswith("num_")]
+    if not cols:
+        return {int(n): 0 for n in universo}
+
+    arr = df[cols].to_numpy(dtype=np.int64)
+    atrasos: Dict[int, int] = {}
+    total = int(arr.shape[0])
+    for numero in universo:
+        atraso = total
+        for idx in range(total - 1, -1, -1):
+            if int(numero) in set(arr[idx].tolist()):
+                atraso = (total - 1) - idx
+                break
+        atrasos[int(numero)] = int(atraso)
+    return atrasos
+
+
+def _construir_referencias_evolutivas(
+    df: pd.DataFrame,
+    tipo_loteria: str,
+    top_n: int,
+) -> List[List[int]]:
+    janela = _janela_evolutiva(df, tamanho=10)
+    cols = [c for c in janela.columns if c.startswith("num_")]
+    if not cols:
+        return []
+
+    arr = janela[cols].to_numpy(dtype=np.int64)
+    min_num = _limites_dezenas_por_tipo(tipo_loteria)[2]
+    universo = list(range(min_num, _max_num_por_tipo(tipo_loteria, df) + 1))
+    ultimo_jogo = set(arr[-1].tolist()) if arr.size else set()
+    atrasos = _atrasos_por_numero(df, universo)
+
+    cont = np.bincount(arr.ravel(), minlength=max(universo) + 1).astype(np.float64)
+    ranking = sorted(
+        universo,
+        key=lambda d: (-float(cont[d]), -float(atrasos.get(d, 0)), d),
+    )
+
+    tamanho_fixo = max(1, top_n - 1)
+    fixas = ranking[:tamanho_fixo]
+    variaveis = [
+        d
+        for d in sorted(
+            universo,
+            key=lambda x: (-float(atrasos.get(x, 0)), float(cont[x]), x),
+        )
+        if d not in fixas and d not in ultimo_jogo
+    ]
+    if not variaveis:
+        variaveis = [d for d in universo if d not in fixas]
+
+    referencias: List[List[int]] = []
+    for variavel in variaveis:
+        jogo = sorted(fixas + [int(variavel)])
+        if len(jogo) == top_n:
+            referencias.append(jogo)
+
+    if not referencias:
+        referencias.append(sorted(ranking[:top_n]))
+
+    return referencias
+
+
+def _reparar_cromossomo(
+    genes: List[int],
+    universo: List[int],
+    tamanho: int,
+    rng: np.random.Generator,
+) -> List[int]:
+    vistos: set[int] = set()
+    reparado: List[int] = []
+
+    for gene in genes:
+        g = int(gene)
+        if g not in vistos and g in universo:
+            reparado.append(g)
+            vistos.add(g)
+        if len(reparado) >= tamanho:
+            return reparado[:tamanho]
+
+    faltantes = [int(n) for n in universo if int(n) not in vistos]
+    if faltantes:
+        faltantes = [int(x) for x in rng.permutation(np.asarray(faltantes, dtype=np.int64)).tolist()]
+        reparado.extend(faltantes[: max(0, tamanho - len(reparado))])
+
+    return reparado[:tamanho]
+
+
+def _fitness_evolutivo(
+    cromossomo: List[int],
+    referencias: List[List[int]],
+) -> float:
+    if not referencias:
+        return 0.0
+
+    genes = set(int(g) for g in cromossomo)
+    fitness = 0.0
+    for idx, referencia in enumerate(referencias):
+        peso = max(0.35, 1.0 - (0.03 * idx))
+        fitness += peso * len(genes.intersection(int(d) for d in referencia))
+    return float(fitness)
+
+
+def predizer_evolutivo(
+    df: pd.DataFrame,
+    top_n: int,
+    tipo_loteria: str,
+) -> List[int]:
+    cols = [c for c in df.columns if c.startswith("num_")]
+    if not cols:
+        return []
+
+    referencias = _construir_referencias_evolutivas(df, tipo_loteria, top_n)
+    if not referencias:
+        return predizer_por_frequencia(df, top_n)
+
+    min_num = _limites_dezenas_por_tipo(tipo_loteria)[2]
+    max_num = _max_num_por_tipo(tipo_loteria, df)
+    universo = list(range(min_num, max_num + 1))
+    rng = np.random.default_rng(_RANDOM_STATE + len(df) + top_n + max_num)
+
+    tamanho_pop = max(20, int(_LOTO_GA_POP_SIZE))
+    quantidade_geracoes = max(5, int(_LOTO_GA_GENERATIONS))
+    quantidade_torneios = max(2, min(int(_LOTO_GA_TOURNAMENTS), tamanho_pop))
+
+    populacao: List[List[int]] = []
+    for _ in range(tamanho_pop):
+        genes = rng.choice(universo, size=top_n, replace=False).astype(np.int64).tolist()
+        populacao.append([int(g) for g in genes])
+
+    melhor = populacao[0]
+    melhor_fitness = _fitness_evolutivo(melhor, referencias)
+
+    for _ in range(quantidade_geracoes):
+        fitnesses = np.asarray([_fitness_evolutivo(ind, referencias) for ind in populacao], dtype=np.float64)
+        idx_melhor = int(np.argmax(fitnesses))
+        if float(fitnesses[idx_melhor]) >= melhor_fitness:
+            melhor = list(populacao[idx_melhor])
+            melhor_fitness = float(fitnesses[idx_melhor])
+
+        pais: List[List[int]] = []
+        for _ in range(quantidade_torneios):
+            duelistas = rng.choice(len(populacao), size=2, replace=False)
+            idx_vencedor = int(
+                duelistas[0]
+                if fitnesses[int(duelistas[0])] >= fitnesses[int(duelistas[1])]
+                else duelistas[1]
+            )
+            pais.append(list(populacao[idx_vencedor]))
+
+        filhos: List[List[int]] = []
+        while len(filhos) < tamanho_pop:
+            idx_pais = rng.choice(len(pais), size=2, replace=False)
+            pai_a = list(pais[int(idx_pais[0])])
+            pai_b = list(pais[int(idx_pais[1])])
+            ponto = int(rng.integers(1, top_n)) if top_n > 1 else 1
+
+            filho_a = _reparar_cromossomo(pai_a[:ponto] + pai_b[ponto:], universo, top_n, rng)
+            filho_b = _reparar_cromossomo(pai_b[:ponto] + pai_a[ponto:], universo, top_n, rng)
+
+            if top_n > 1 and rng.random() < _LOTO_GA_MUTATION_RATE:
+                i, j = rng.choice(top_n, size=2, replace=False)
+                filho_a[int(i)], filho_a[int(j)] = filho_a[int(j)], filho_a[int(i)]
+            if top_n > 1 and rng.random() < _LOTO_GA_MUTATION_RATE:
+                i, j = rng.choice(top_n, size=2, replace=False)
+                filho_b[int(i)], filho_b[int(j)] = filho_b[int(j)], filho_b[int(i)]
+
+            filhos.append(filho_a)
+            if len(filhos) < tamanho_pop:
+                filhos.append(filho_b)
+
+        populacao = filhos
+
+    return sorted(int(g) for g in melhor[:top_n])
+
+
+def _construir_referencias_evolutivas_supersete(df: pd.DataFrame) -> List[List[int]]:
+    cols = _cols_num(df)
+    if not cols:
+        return []
+
+    janela = _janela_evolutiva(df, tamanho=10)
+    arr = janela[cols].to_numpy(dtype=np.int64)
+    if arr.size == 0:
+        return []
+
+    ultimo = arr[-1, :7]
+    fixas: List[int] = []
+    alternativas_por_posicao: List[List[int]] = []
+
+    for pos in range(min(7, arr.shape[1])):
+        col = arr[:, pos]
+        col = col[(col >= 0) & (col <= 9)]
+        if col.size == 0:
+            fixas.append(0)
+            alternativas_por_posicao.append([0])
+            continue
+
+        cont = np.bincount(col, minlength=10).astype(np.float64)
+        ranking = sorted(range(10), key=lambda d: (-float(cont[d]), d))
+        fixas.append(int(ranking[0]))
+        alternativas = [int(d) for d in ranking if int(d) != int(ultimo[pos])]
+        if not alternativas:
+            alternativas = [int(d) for d in ranking]
+        alternativas_por_posicao.append(alternativas)
+
+    referencias = [list(fixas)]
+    for pos in range(7):
+        jogo = list(fixas)
+        jogo[pos] = int(alternativas_por_posicao[pos][0])
+        referencias.append(jogo)
+
+    return referencias
+
+
+def _fitness_evolutivo_supersete(
+    cromossomo: List[int],
+    referencias: List[List[int]],
+) -> float:
+    fitness = 0.0
+    for idx, referencia in enumerate(referencias):
+        peso = max(0.4, 1.0 - (0.05 * idx))
+        fitness += peso * float(sum(int(a) == int(b) for a, b in zip(cromossomo[:7], referencia[:7])))
+    return float(fitness)
+
+
+def predizer_evolutivo_supersete(df: pd.DataFrame) -> List[int]:
+    referencias = _construir_referencias_evolutivas_supersete(df)
+    if not referencias:
+        return predizer_supersete_por_frequencia(df)
+
+    rng = np.random.default_rng(_RANDOM_STATE + len(df) + 7)
+    tamanho_pop = max(20, int(_LOTO_GA_POP_SIZE))
+    quantidade_geracoes = max(5, int(_LOTO_GA_GENERATIONS))
+    quantidade_torneios = max(2, min(int(_LOTO_GA_TOURNAMENTS), tamanho_pop))
+
+    populacao = [
+        [int(x) for x in rng.integers(0, 10, size=7).tolist()]
+        for _ in range(tamanho_pop)
+    ]
+
+    melhor = list(populacao[0])
+    melhor_fitness = _fitness_evolutivo_supersete(melhor, referencias)
+
+    for _ in range(quantidade_geracoes):
+        fitnesses = np.asarray(
+            [_fitness_evolutivo_supersete(ind, referencias) for ind in populacao],
+            dtype=np.float64,
+        )
+        idx_melhor = int(np.argmax(fitnesses))
+        if float(fitnesses[idx_melhor]) >= melhor_fitness:
+            melhor = list(populacao[idx_melhor])
+            melhor_fitness = float(fitnesses[idx_melhor])
+
+        pais: List[List[int]] = []
+        for _ in range(quantidade_torneios):
+            duelistas = rng.choice(len(populacao), size=2, replace=False)
+            idx_vencedor = int(
+                duelistas[0]
+                if fitnesses[int(duelistas[0])] >= fitnesses[int(duelistas[1])]
+                else duelistas[1]
+            )
+            pais.append(list(populacao[idx_vencedor]))
+
+        filhos: List[List[int]] = []
+        while len(filhos) < tamanho_pop:
+            idx_pais = rng.choice(len(pais), size=2, replace=False)
+            pai_a = list(pais[int(idx_pais[0])])
+            pai_b = list(pais[int(idx_pais[1])])
+            ponto = int(rng.integers(1, 7))
+
+            filho_a = pai_a[:ponto] + pai_b[ponto:]
+            filho_b = pai_b[:ponto] + pai_a[ponto:]
+
+            if rng.random() < _LOTO_GA_MUTATION_RATE:
+                idx_gene = int(rng.integers(0, 7))
+                filho_a[idx_gene] = int(rng.integers(0, 10))
+            if rng.random() < _LOTO_GA_MUTATION_RATE:
+                idx_gene = int(rng.integers(0, 7))
+                filho_b[idx_gene] = int(rng.integers(0, 10))
+
+            filhos.append([int(v) for v in filho_a[:7]])
+            if len(filhos) < tamanho_pop:
+                filhos.append([int(v) for v in filho_b[:7]])
+
+        populacao = filhos
+
+    return [int(v) for v in melhor[:7]]
+
+
 def _binarizar_sorteios(arr: np.ndarray, max_d: int) -> np.ndarray:
     """
     Converte matriz (n_sorteios, k_dezenas) em matriz binária (n_sorteios, max_d+1).
@@ -474,12 +827,18 @@ def _indices_walk_forward(n_samples: int) -> List[int]:
     if n_samples < 8:
         return []
 
-    min_train = max(6, min(24, n_samples // 2))
+    # Mantem uma base inicial razoavel para treino, sem consumir metade
+    # da serie quando houver muitos concursos disponiveis.
+    min_train = max(6, min(24, n_samples // 3))
     if min_train >= n_samples:
         return []
 
     candidatos = np.arange(min_train, n_samples, dtype=np.int64)
-    max_splits = min(_LOTO_CV_SPLITS, len(candidatos))
+    # A validacao temporal nao deve ficar presa ao CV interno dos modelos.
+    # Escalamos a quantidade de checkpoints conforme o tamanho da serie,
+    # preservando um limite superior para nao deixar a execucao pesada.
+    alvo_validacoes = max(_LOTO_CV_SPLITS, min(30, max(8, n_samples // 12)))
+    max_splits = min(alvo_validacoes, len(candidatos))
     if max_splits <= 0:
         return []
 
@@ -1951,11 +2310,13 @@ def gerar_palpite(
         _report(12, "Calculando heuristicas de frequencia e recencia...")
         freq = predizer_supersete_por_frequencia(df)
         rec = predizer_supersete_por_recencia(df)
-        _report(28, "Executando Random Forest...")
+        _report(24, "Executando Algoritmo Evolutivo...")
+        evo = predizer_evolutivo_supersete(df)
+        _report(36, "Executando Random Forest...")
         rf, rf_metricas = predizer_random_forest(df, top_n, tipo_loteria)
-        _report(46, "Executando Regressao Logistica...")
+        _report(50, "Executando Regressao Logistica...")
         lg, lg_metricas = predizer_logistic(df, top_n, tipo_loteria)
-        _report(62, "Executando KNN...")
+        _report(64, "Executando KNN...")
         kn, kn_metricas = predizer_knn(df, top_n, tipo_loteria)
         _report(78, "Executando Gradient Boosting...")
         gb, gb_metricas = predizer_gb(df, top_n, tipo_loteria)
@@ -1963,6 +2324,7 @@ def gerar_palpite(
         resultados: Dict[str, Any] = {
             "frequencia_simples": freq,
             "recencia_ponderada": rec,
+            "algoritmo_evolutivo": evo,
             "random_forest": rf,
             "logistic_regression": lg,
             "k_nearest_neighbors": kn,
@@ -1972,6 +2334,7 @@ def gerar_palpite(
         avaliacao_detalhada: Dict[str, Dict[str, float]] = {
             "frequencia_simples": _avaliar_heuristica_supersete(df, predizer_supersete_por_frequencia),
             "recencia_ponderada": _avaliar_heuristica_supersete(df, predizer_supersete_por_recencia),
+            "algoritmo_evolutivo": _avaliar_heuristica_supersete(df, predizer_evolutivo_supersete),
             "random_forest": rf_metricas,
             "logistic_regression": lg_metricas,
             "k_nearest_neighbors": kn_metricas,
@@ -2039,6 +2402,10 @@ def gerar_palpite(
             "max_num": int(max_num),
             "lookback_usado": int(_LOTO_LOOKBACK),
             "cv_splits_max": int(_LOTO_CV_SPLITS),
+            "ga_pop_size": int(_LOTO_GA_POP_SIZE),
+            "ga_generations": int(_LOTO_GA_GENERATIONS),
+            "ga_tournaments": int(_LOTO_GA_TOURNAMENTS),
+            "ga_mutation_rate": float(round(_LOTO_GA_MUTATION_RATE, 4)),
             "rf_n_estimators": int(_LOTO_RF_N_ESTIMATORS),
             "gb_n_estimators": int(_LOTO_GB_N_ESTIMATORS),
         }
@@ -2059,11 +2426,13 @@ def gerar_palpite(
     _report(12, "Calculando heuristicas de frequencia e recencia...")
     freq = predizer_por_frequencia(df, top_n)
     rec = predizer_por_recencia(df, top_n)
-    _report(28, "Executando Random Forest...")
+    _report(24, "Executando Algoritmo Evolutivo...")
+    evo = predizer_evolutivo(df, top_n, tipo_loteria)
+    _report(36, "Executando Random Forest...")
     rf, rf_metricas = predizer_random_forest(df, top_n, tipo_loteria)
-    _report(46, "Executando Regressao Logistica...")
+    _report(50, "Executando Regressao Logistica...")
     lg, lg_metricas = predizer_logistic(df, top_n, tipo_loteria)
-    _report(62, "Executando KNN...")
+    _report(64, "Executando KNN...")
     kn, kn_metricas = predizer_knn(df, top_n, tipo_loteria)
     _report(78, "Executando Gradient Boosting...")
     gb, gb_metricas = predizer_gb(df, top_n, tipo_loteria)
@@ -2071,6 +2440,7 @@ def gerar_palpite(
     resultados = {
         "frequencia_simples": freq,
         "recencia_ponderada": rec,
+        "algoritmo_evolutivo": evo,
         "random_forest": rf,
         "logistic_regression": lg,
         "k_nearest_neighbors": kn,
@@ -2089,6 +2459,12 @@ def gerar_palpite(
             tipo_loteria,
             top_n,
             predizer_por_recencia,
+        ),
+        "algoritmo_evolutivo": _avaliar_heuristica_multilabel(
+            df,
+            tipo_loteria,
+            top_n,
+            lambda dados, n: predizer_evolutivo(dados, n, tipo_loteria),
         ),
         "random_forest": rf_metricas,
         "logistic_regression": lg_metricas,
@@ -2155,6 +2531,10 @@ def gerar_palpite(
         "max_num": int(max_num),
         "lookback_usado": int(_LOTO_LOOKBACK),
         "cv_splits_max": int(_LOTO_CV_SPLITS),
+        "ga_pop_size": int(_LOTO_GA_POP_SIZE),
+        "ga_generations": int(_LOTO_GA_GENERATIONS),
+        "ga_tournaments": int(_LOTO_GA_TOURNAMENTS),
+        "ga_mutation_rate": float(round(_LOTO_GA_MUTATION_RATE, 4)),
         "rf_n_estimators": int(_LOTO_RF_N_ESTIMATORS),
         "gb_n_estimators": int(_LOTO_GB_N_ESTIMATORS),
     }
