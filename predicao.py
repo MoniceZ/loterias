@@ -1606,6 +1606,13 @@ def _peso_modelo_ensemble(score_atual: float, score_historico: float) -> float:
     return float(max(0.15, 0.25 + (0.85 * score_atual) + (0.45 * score_historico)))
 
 
+def _peso_posicao_lista(posicao: int, total_itens: int) -> float:
+    total_itens = max(1, int(total_itens))
+    posicao = max(0, int(posicao))
+    # Valoriza o topo do ranking sem zerar dezenas que ficaram mais abaixo.
+    return float(1.0 + ((total_itens - min(posicao, total_itens - 1)) / total_itens))
+
+
 def _resumo_modelos(
     avaliacao_modelos: Dict[str, float],
     pesos_modelos: Dict[str, float],
@@ -2140,13 +2147,15 @@ def gerar_palpite(
             ),
         }
 
-        votos_pos: List[Counter[int]] = [Counter() for _ in range(7)]
-        for nome, lista in resultados.items():
-            peso = float(pesos_modelos.get(nome, 1.0))
-            if not isinstance(lista, list):
-                continue
-            for pos in range(min(7, len(lista))):
-                votos_pos[pos][int(lista[pos])] += peso
+    votos_pos: List[Counter[int]] = [Counter() for _ in range(7)]
+    for nome, lista in resultados.items():
+        peso = float(pesos_modelos.get(nome, 1.0))
+        if not isinstance(lista, list):
+            continue
+        total_itens = len(lista)
+        for pos in range(min(7, total_itens)):
+            peso_posicao = _peso_posicao_lista(pos, total_itens)
+            votos_pos[pos][int(lista[pos])] += peso * peso_posicao
 
         melhores: List[int] = []
         for pos in range(7):
@@ -2487,8 +2496,10 @@ def gerar_palpite(
     votos: Counter[int] = Counter()
     for nome, lista in resultados.items():
         peso = float(pesos_modelos.get(nome, 1.0))
-        for d in lista:
-            votos[int(d)] += peso
+        total_itens = len(lista)
+        for pos, d in enumerate(lista):
+            peso_posicao = _peso_posicao_lista(pos, total_itens)
+            votos[int(d)] += peso * peso_posicao
 
     melhores = sorted(_rank_dezenas_por_pontuacao(votos, min_num, max_num)[:top_n])
 
